@@ -2,12 +2,11 @@ package dynamo
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"sync/atomic"
+	"time"
 
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 // Status is an enumeration of table and index statuses.
@@ -33,8 +32,6 @@ const (
 type Table struct {
 	name string
 	db   *DB
-	// desc is this table's cached description, used for inferring keys
-	desc *atomic.Value // Description
 }
 
 // Table returns a Table handle specified by name.
@@ -42,7 +39,6 @@ func (db *DB) Table(name string) Table {
 	return Table{
 		name: name,
 		db:   db,
-		desc: new(atomic.Value),
 	}
 }
 
@@ -53,15 +49,7 @@ func (table Table) Name() string {
 
 // Wait blocks until this table's status matches any status provided by want.
 // If no statuses are specified, the active status is used.
-func (table Table) Wait(want ...Status) error {
-	ctx, cancel := defaultContext()
-	defer cancel()
-	return table.WaitWithContext(ctx, want...)
-}
-
-// Wait blocks until this table's status matches any status provided by want.
-// If no statuses are specified, the active status is used.
-func (table Table) WaitWithContext(ctx context.Context, want ...Status) error {
+func (table Table) Wait(ctx context.Context, want ...Status) error {
 	if len(want) == 0 {
 		want = []Status{ActiveStatus}
 	}
@@ -72,38 +60,43 @@ func (table Table) WaitWithContext(ctx context.Context, want ...Status) error {
 		}
 	}
 
-	err := table.db.retry(ctx, func() error {
-		desc, err := table.Describe().RunWithContext(ctx)
-		var aerr awserr.RequestFailure
-		if errors.As(err, &aerr) {
-			if aerr.Code() == "ResourceNotFoundException" {
-				if wantGone {
-					return nil
-				}
-				return errRetry
-			}
-		}
-		if err != nil {
-			return err
-		}
+	// I don't know why AWS wants a context _and_ a duration param.
+	// Infer it from context; if it's indefinite then set it to something really high (1 day)
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(24 * time.Hour)
+	}
+	maxDur := time.Until(deadline)
 
-		for _, status := range want {
-			if status == desc.Status {
-				return nil
+	if wantGone {
+		waiter := dynamodb.NewTableNotExistsWaiter(table.db.client)
+		return waiter.Wait(ctx, table.Describe().input(), maxDur)
+	}
+
+	waiter := dynamodb.NewTableExistsWaiter(table.db.client, func(opts *dynamodb.TableExistsWaiterOptions) {
+		fallback := opts.Retryable
+		opts.Retryable = func(ctx context.Context, in *dynamodb.DescribeTableInput, out *dynamodb.DescribeTableOutput, err error) (bool, error) {
+			if err == nil && out != nil && out.Table != nil {
+				status := string(out.Table.TableStatus)
+				for _, wantStatus := range want {
+					if status == string(wantStatus) {
+						return false, nil
+					}
+				}
 			}
+			return fallback(ctx, in, out, err)
 		}
-		return errRetry
 	})
-	return err
+	return waiter.Wait(ctx, table.Describe().input(), maxDur)
 }
 
 // primaryKeys attempts to determine this table's primary keys.
 // It will try:
-//   - output LastEvaluatedKey
-//   - input ExclusiveStartKey
-//   - DescribeTable as a last resort (cached inside table)
-func (table Table) primaryKeys(ctx context.Context, lek, esk map[string]*dynamodb.AttributeValue, index string) (map[string]struct{}, error) {
-	extract := func(item map[string]*dynamodb.AttributeValue) map[string]struct{} {
+// - output LastEvaluatedKey
+// - input ExclusiveStartKey
+// - DescribeTable as a last resort (cached inside table)
+func (table Table) primaryKeys(ctx context.Context, lek, esk Item, index string) (map[string]struct{}, error) {
+	extract := func(item Item) map[string]struct{} {
 		keys := make(map[string]struct{}, len(item))
 		for k := range item {
 			keys[k] = struct{}{}
@@ -122,7 +115,8 @@ func (table Table) primaryKeys(ctx context.Context, lek, esk map[string]*dynamod
 	// now we're forced to call DescribeTable
 
 	// do we have a description cached?
-	if desc, ok := table.desc.Load().(Description); ok {
+
+	if desc, ok := table.db.loadDesc(table.name); ok {
 		keys := desc.keys(index)
 		if keys != nil {
 			return keys, nil
@@ -133,7 +127,7 @@ func (table Table) primaryKeys(ctx context.Context, lek, esk map[string]*dynamod
 
 	keys := make(map[string]struct{})
 	err := table.db.retry(ctx, func() error {
-		desc, err := table.Describe().RunWithContext(ctx)
+		desc, err := table.Describe().Run(ctx)
 		if err != nil {
 			return err
 		}
@@ -149,7 +143,7 @@ func (table Table) primaryKeys(ctx context.Context, lek, esk map[string]*dynamod
 	return keys, nil
 }
 
-func lekify(item map[string]*dynamodb.AttributeValue, keys map[string]struct{}) (map[string]*dynamodb.AttributeValue, error) {
+func lekify(item Item, keys map[string]struct{}) (Item, error) {
 	if item == nil {
 		// this shouldn't happen because in queries without results, a LastEvaluatedKey should be given to us by AWS
 		return nil, fmt.Errorf("dynamo: can't determine LastEvaluatedKey: no keys or results")
@@ -157,7 +151,7 @@ func lekify(item map[string]*dynamodb.AttributeValue, keys map[string]struct{}) 
 	if keys == nil {
 		return nil, fmt.Errorf("dynamo: can't determine LastEvaluatedKey: failed to infer primary keys")
 	}
-	lek := make(map[string]*dynamodb.AttributeValue, len(keys))
+	lek := make(Item, len(keys))
 	for k := range keys {
 		v, ok := item[k]
 		if !ok {
@@ -180,34 +174,20 @@ func (table Table) DeleteTable() *DeleteTable {
 }
 
 // Run executes this request and deletes the table.
-func (dt *DeleteTable) Run() error {
-	ctx, cancel := defaultContext()
-	defer cancel()
-	return dt.RunWithContext(ctx)
-}
-
-// RunWithContext executes this request and deletes the table.
-func (dt *DeleteTable) RunWithContext(ctx context.Context) error {
+func (dt *DeleteTable) Run(ctx context.Context) error {
 	input := dt.input()
 	return dt.table.db.retry(ctx, func() error {
-		_, err := dt.table.db.client.DeleteTableWithContext(ctx, input)
+		_, err := dt.table.db.client.DeleteTable(ctx, input)
 		return err
 	})
 }
 
 // Wait executes this request and blocks until the table is finished deleting.
-func (dt *DeleteTable) Wait() error {
-	ctx, cancel := defaultContext()
-	defer cancel()
-	return dt.WaitWithContext(ctx)
-}
-
-// WaitWithContext executes this request and blocks until the table is finished deleting.
-func (dt *DeleteTable) WaitWithContext(ctx context.Context) error {
-	if err := dt.RunWithContext(ctx); err != nil {
+func (dt *DeleteTable) Wait(ctx context.Context) error {
+	if err := dt.Run(ctx); err != nil {
 		return err
 	}
-	return dt.table.WaitWithContext(ctx, NotExistsStatus)
+	return dt.table.Wait(ctx, NotExistsStatus)
 }
 
 func (dt *DeleteTable) input() *dynamodb.DeleteTableInput {
@@ -227,6 +207,7 @@ type ConsumedCapacity struct {
 	// Write is the total number of write capacity units consumed during this operation.
 	// This seems to be only set for transactions.
 	Write float64
+
 	// GSI is a map of Global Secondary Index names to total consumed capacity units.
 	GSI map[string]float64
 	// GSIRead is a map of Global Secondary Index names to consumed read capacity units.
@@ -235,6 +216,7 @@ type ConsumedCapacity struct {
 	// GSIWrite is a map of Global Secondary Index names to consumed write capacity units.
 	// This seems to be only set for transactions.
 	GSIWrite map[string]float64
+
 	// LSI is a map of Local Secondary Index names to total consumed capacity units.
 	LSI map[string]float64
 	// LSIRead is a map of Local Secondary Index names to consumed read capacity units.
@@ -243,6 +225,7 @@ type ConsumedCapacity struct {
 	// LSIWrite is a map of Local Secondary Index names to consumed write capacity units.
 	// This seems to be only set for transactions.
 	LSIWrite map[string]float64
+
 	// Table is the amount of total throughput consumed by the table.
 	Table float64
 	// TableRead is the amount of read throughput consumed by the table.
@@ -253,9 +236,12 @@ type ConsumedCapacity struct {
 	TableWrite float64
 	// TableName is the name of the table affected by this operation.
 	TableName string
+
+	// Requests is the number of SDK requests made against DynamoDB's API.
+	Requests int
 }
 
-func addConsumedCapacity(cc *ConsumedCapacity, raw *dynamodb.ConsumedCapacity) {
+func (cc *ConsumedCapacity) add(raw *types.ConsumedCapacity) {
 	if cc == nil || raw == nil {
 		return
 	}
@@ -322,6 +308,13 @@ func addConsumedCapacity(cc *ConsumedCapacity, raw *dynamodb.ConsumedCapacity) {
 	}
 }
 
+func (cc *ConsumedCapacity) incRequests() {
+	if cc == nil {
+		return
+	}
+	cc.Requests++
+}
+
 func mergeConsumedCapacity(dst, src *ConsumedCapacity) {
 	if dst == nil || src == nil {
 		return
@@ -383,4 +376,32 @@ func mergeConsumedCapacity(dst, src *ConsumedCapacity) {
 	if dst.TableName == "" && src.TableName != "" {
 		dst.TableName = src.TableName
 	}
+	dst.Requests += src.Requests
+}
+
+// ScanMetrics represents the metrics returned by a Scan or Query operation.
+// Use this to track the number of items scanned and returned across paginated requests.
+type ScanMetrics struct {
+	// Scanned is the number of items examined before any filter expression was applied.
+	// This corresponds to DynamoDB's ScannedCount.
+	Scanned int64
+	// Count is the number of items returned after filtering.
+	// This corresponds to DynamoDB's Count.
+	Count int64
+}
+
+func (sm *ScanMetrics) add(scanned, count int32) {
+	if sm == nil {
+		return
+	}
+	sm.Scanned += int64(scanned)
+	sm.Count += int64(count)
+}
+
+func mergeScanMetrics(dst, src *ScanMetrics) {
+	if dst == nil || src == nil {
+		return
+	}
+	dst.Scanned += src.Scanned
+	dst.Count += src.Count
 }

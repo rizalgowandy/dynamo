@@ -4,11 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
+
+type pair struct {
+	Key   string
+	Value types.AttributeValue
+}
 
 // Query is a request to get one or more items in a table.
 // Query uses the DynamoDB query for requests for multiple items, and GetItem for one.
@@ -16,27 +22,30 @@ import (
 // and http://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_GetItem.html
 type Query struct {
 	table    Table
-	startKey map[string]*dynamodb.AttributeValue
+	startKey Item
 	index    string
 
 	hashKey   string
-	hashValue *dynamodb.AttributeValue
+	hashValue types.AttributeValue
+	hashKeys  []pair
 
 	rangeKey    string
-	rangeValues []*dynamodb.AttributeValue
+	rangeValues []types.AttributeValue
 	rangeOp     Operator
 
 	projection  string
 	filters     []string
 	consistent  bool
-	limit       int64
-	searchLimit int64
+	limit       int
+	searchLimit int32
+	reqLimit    int
 	order       *Order
 
 	subber
 
 	err error
 	cc  *ConsumedCapacity
+	sm  *ScanMetrics
 }
 
 var (
@@ -61,6 +70,24 @@ const (
 	Between        Operator = "BETWEEN"
 )
 
+func (op Operator) graphic() string {
+	switch op {
+	case Equal:
+		return "="
+	case NotEqual:
+		return "<>"
+	case Less:
+		return "<"
+	case LessOrEqual:
+		return "<="
+	case Greater:
+		return ">"
+	case GreaterOrEqual:
+		return ">="
+	}
+	return ""
+}
+
 // Order is used for specifying the order of results.
 type Order bool
 
@@ -70,7 +97,7 @@ const (
 	Descending       = false // ScanIndexForward = false
 )
 
-var selectCount = aws.String("COUNT")
+var selectCount types.Select = "COUNT"
 
 // Get creates a new request to get an item.
 // Name is the name of the hash key (a.k.a. partition key).
@@ -83,6 +110,27 @@ func (table Table) Get(name string, value interface{}) *Query {
 	q.hashValue, q.err = marshal(value, flagNone)
 	if q.hashValue == nil {
 		q.setError(fmt.Errorf("dynamo: query hash key value is nil or omitted for attribute %q", q.hashKey))
+	}
+	return q
+}
+
+// GetComposite creates a new request to get an item using a composite key (multiple hash/range keys).
+// keyValues is map of hash/range key (a.k.a. partition/sort key) attribute names to values.
+// Use the Range method of Query to optionally specify the final range key (a.k.a. sort keys).
+// This is a feature of global secondary indexes, use the Index method of Query to specify the index name.
+//
+// See: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html#GSI.MultiAttributeKeys
+func (table Table) GetComposite(keyValues map[string]any) *Query {
+	q := &Query{
+		table: table,
+	}
+	for k, v := range keyValues {
+		enc, err := marshal(v, flagNone)
+		q.setError(err)
+		if enc == nil {
+			q.setError(fmt.Errorf("dynamo: query hash key value is nil or omitted for attribute %q", q.hashKey))
+		}
+		q.hashKeys = append(q.hashKeys, pair{k, enc})
 	}
 	return q
 }
@@ -169,7 +217,7 @@ func (q *Query) Consistent(on bool) *Query {
 }
 
 // Limit specifies the maximum amount of results to return.
-func (q *Query) Limit(limit int64) *Query {
+func (q *Query) Limit(limit int) *Query {
 	q.limit = limit
 	return q
 }
@@ -177,8 +225,17 @@ func (q *Query) Limit(limit int64) *Query {
 // SearchLimit specifies the maximum amount of results to examine.
 // If a filter is not specified, the number of results will be limited.
 // If a filter is specified, the number of results to consider for filtering will be limited.
-func (q *Query) SearchLimit(limit int64) *Query {
-	q.searchLimit = limit
+// SearchLimit > 0 implies RequestLimit(1).
+// Note: limit will be capped to MaxInt32 as that is the maximum number the DynamoDB API will accept.
+func (q *Query) SearchLimit(limit int) *Query {
+	q.searchLimit = int32(min(limit, math.MaxInt32))
+	return q
+}
+
+// RequestLimit specifies the maximum amount of requests to make against DynamoDB's API.
+// A limit of zero or less means unlimited requests.
+func (q *Query) RequestLimit(limit int) *Query {
+	q.reqLimit = limit
 	return q
 }
 
@@ -195,15 +252,18 @@ func (q *Query) ConsumedCapacity(cc *ConsumedCapacity) *Query {
 	return q
 }
 
-// One executes this query and retrieves a single result,
-// unmarshaling the result to out.
-func (q *Query) One(out interface{}) error {
-	ctx, cancel := defaultContext()
-	defer cancel()
-	return q.OneWithContext(ctx, out)
+// ScanMetrics will measure the number of items scanned and returned by this operation and add it to sm.
+func (q *Query) ScanMetrics(sm *ScanMetrics) *Query {
+	q.sm = sm
+	return q
 }
 
-func (q *Query) OneWithContext(ctx context.Context, out interface{}) error {
+// One executes this query and retrieves a single result,
+// unmarshaling the result to out.
+// This uses the DynamoDB GetItem API when possible, otherwise Query.
+// If the query returns more than one result, [ErrTooMany] may be returned. This is intended as a diagnostic for query mistakes.
+// To avoid [ErrTooMany], set the [Query.Limit] to 1.
+func (q *Query) One(ctx context.Context, out interface{}) error {
 	if q.err != nil {
 		return q.err
 	}
@@ -215,7 +275,8 @@ func (q *Query) OneWithContext(ctx context.Context, out interface{}) error {
 		var res *dynamodb.GetItemOutput
 		err := q.table.db.retry(ctx, func() error {
 			var err error
-			res, err = q.table.db.client.GetItemWithContext(ctx, req)
+			res, err = q.table.db.client.GetItem(ctx, req)
+			q.cc.incRequests()
 			if err != nil {
 				return err
 			}
@@ -227,89 +288,79 @@ func (q *Query) OneWithContext(ctx context.Context, out interface{}) error {
 		if err != nil {
 			return err
 		}
-		if q.cc != nil {
-			addConsumedCapacity(q.cc, res.ConsumedCapacity)
-		}
+		q.cc.add(res.ConsumedCapacity)
 
 		return unmarshalItem(res.Item, out)
 	}
 
 	// If not, try a Query.
-	req := q.queryInput()
-
-	var res *dynamodb.QueryOutput
-	err := q.table.db.retry(ctx, func() error {
-		var err error
-		res, err = q.table.db.client.QueryWithContext(ctx, req)
-		if err != nil {
-			return err
-		}
-
-		switch {
-		case len(res.Items) == 0:
-			return ErrNotFound
-		case len(res.Items) > 1 && q.limit != 1:
-			return ErrTooMany
-		case res.LastEvaluatedKey != nil && q.searchLimit != 0:
-			return ErrTooMany
-		}
-
-		return nil
-	})
-	if err != nil {
+	iter := q.newIter(unmarshalItem)
+	var item Item
+	ok := iter.Next(ctx, &item)
+	if err := iter.Err(); err != nil {
 		return err
 	}
-	if q.cc != nil {
-		addConsumedCapacity(q.cc, res.ConsumedCapacity)
+	if !ok {
+		return ErrNotFound
 	}
-
-	return unmarshalItem(res.Items[0], out)
+	// Best effort: do we have any pending unused items?
+	if iter.hasMore() {
+		return ErrTooMany
+	}
+	return unmarshalItem(item, out)
 }
 
 // Count executes this request, returning the number of results.
-func (q *Query) Count() (int64, error) {
-	ctx, cancel := defaultContext()
-	defer cancel()
-	return q.CountWithContext(ctx)
-}
-
-func (q *Query) CountWithContext(ctx context.Context) (int64, error) {
+func (q *Query) Count(ctx context.Context) (int, error) {
 	if q.err != nil {
 		return 0, q.err
 	}
 
-	var count int64
+	var count int
+	var scanned int32
+	var reqs int
 	var res *dynamodb.QueryOutput
 	for {
-		req := q.queryInput()
-		req.Select = selectCount
+		input := q.queryInput()
+		input.Select = selectCount
 
 		err := q.table.db.retry(ctx, func() error {
 			var err error
-			res, err = q.table.db.client.QueryWithContext(ctx, req)
+			res, err = q.table.db.client.Query(ctx, input)
+			q.cc.incRequests()
 			if err != nil {
 				return err
 			}
-			if res.Count == nil {
-				return errors.New("nil count")
-			}
-			count += *res.Count
+			reqs++
+
+			count += int(res.Count)
+			scanned += res.ScannedCount
+
 			return nil
 		})
 		if err != nil {
 			return 0, err
 		}
-		if q.cc != nil {
-			addConsumedCapacity(q.cc, res.ConsumedCapacity)
-		}
+		q.cc.add(res.ConsumedCapacity)
 
 		q.startKey = res.LastEvaluatedKey
-		if res.LastEvaluatedKey == nil || q.searchLimit > 0 {
+		if res.LastEvaluatedKey == nil ||
+			(q.limit > 0 && count >= q.limit) ||
+			(q.searchLimit > 0 && scanned >= q.searchLimit) ||
+			(q.reqLimit > 0 && reqs >= q.reqLimit) {
 			break
 		}
 	}
 
 	return count, nil
+}
+
+func (q *Query) newIter(unmarshal unmarshalFunc) *queryIter {
+	return &queryIter{
+		query:     q,
+		unmarshal: unmarshal,
+		err:       q.err,
+	}
 }
 
 // queryIter is the iterator for Query operations
@@ -319,15 +370,16 @@ type queryIter struct {
 	output *dynamodb.QueryOutput
 	err    error
 	idx    int
-	n      int64
+	n      int
+	reqs   int
 
 	// last item evaluated
-	last map[string]*dynamodb.AttributeValue
+	last Item
 	// cache of primary keys, used for generating LEKs
 	keys map[string]struct{}
 	// example LastEvaluatedKey and ExclusiveStartKey, used to lazily evaluate the primary keys if possible
-	exLEK  map[string]*dynamodb.AttributeValue
-	exESK  map[string]*dynamodb.AttributeValue
+	exLEK  Item
+	exESK  Item
 	keyErr error
 
 	unmarshal unmarshalFunc
@@ -335,13 +387,7 @@ type queryIter struct {
 
 // Next tries to unmarshal the next result into out.
 // Returns false when it is complete or if it runs into an error.
-func (itr *queryIter) Next(out interface{}) bool {
-	ctx, cancel := defaultContext()
-	defer cancel()
-	return itr.NextWithContext(ctx, out)
-}
-
-func (itr *queryIter) NextWithContext(ctx context.Context, out interface{}) bool {
+func (itr *queryIter) Next(ctx context.Context, out interface{}) bool {
 	// stop if we have an error
 	if ctx.Err() != nil {
 		itr.err = ctx.Err()
@@ -379,6 +425,10 @@ func (itr *queryIter) NextWithContext(ctx context.Context, out interface{}) bool
 		if itr.output.LastEvaluatedKey == nil || itr.query.searchLimit > 0 {
 			return false
 		}
+		// have we hit the request limit?
+		if itr.query.reqLimit > 0 && itr.reqs == itr.query.reqLimit {
+			return false
+		}
 
 		// no, prepare next request and reset index
 		itr.input.ExclusiveStartKey = itr.output.LastEvaluatedKey
@@ -387,24 +437,28 @@ func (itr *queryIter) NextWithContext(ctx context.Context, out interface{}) bool
 
 	itr.err = itr.query.table.db.retry(ctx, func() error {
 		var err error
-		itr.output, err = itr.query.table.db.client.QueryWithContext(ctx, itr.input)
+		itr.output, err = itr.query.table.db.client.Query(ctx, itr.input)
+		itr.query.cc.incRequests()
 		return err
 	})
 
 	if itr.err != nil {
 		return false
 	}
-	if itr.query.cc != nil {
-		addConsumedCapacity(itr.query.cc, itr.output.ConsumedCapacity)
-	}
+	itr.query.cc.add(itr.output.ConsumedCapacity)
+	itr.query.sm.add(itr.output.ScannedCount, itr.output.Count)
 	if len(itr.output.LastEvaluatedKey) > len(itr.exLEK) {
 		itr.exLEK = itr.output.LastEvaluatedKey
 	}
+	itr.reqs++
 
 	if len(itr.output.Items) == 0 {
+		if itr.query.reqLimit > 0 && itr.reqs == itr.query.reqLimit {
+			return false
+		}
 		if itr.output.LastEvaluatedKey != nil {
 			// we need to retry until we get some data
-			return itr.NextWithContext(ctx, out)
+			return itr.Next(ctx, out)
 		}
 		// we're done
 		return false
@@ -418,93 +472,68 @@ func (itr *queryIter) NextWithContext(ctx context.Context, out interface{}) bool
 	return itr.err == nil
 }
 
+func (itr *queryIter) hasMore() bool {
+	if itr.query.limit > 0 && itr.n == itr.query.limit {
+		return false
+	}
+	return itr.output != nil && itr.idx < len(itr.output.Items)
+}
+
 // Err returns the error encountered, if any.
 // You should check this after Next is finished.
 func (itr *queryIter) Err() error {
 	return itr.err
 }
 
-func (itr *queryIter) LastEvaluatedKey() PagingKey {
+func (itr *queryIter) LastEvaluatedKey(ctx context.Context) (PagingKey, error) {
 	if itr.output != nil {
 		// if we've hit the end of our results, we can use the real LEK
 		if itr.idx == len(itr.output.Items) {
-			return itr.output.LastEvaluatedKey
+			return itr.output.LastEvaluatedKey, nil
 		}
 
 		// figure out the primary keys if needed
 		if itr.keys == nil && itr.keyErr == nil {
-			ctx, _ := defaultContext() // TODO(v2): take context instead of using the default
 			itr.keys, itr.keyErr = itr.query.table.primaryKeys(ctx, itr.exLEK, itr.exESK, itr.query.index)
 		}
 		if itr.keyErr != nil {
 			// primaryKeys can fail if the credentials lack DescribeTable permissions
 			// in order to preserve backwards compatibility, we fall back to the old behavior and warn
 			// see: https://github.com/guregu/dynamo/pull/187#issuecomment-1045183901
-			// TODO(v2): rejigger this API.
-			itr.query.table.db.log("dynamo: Warning:", itr.keyErr, "Returning a later LastEvaluatedKey.")
-			return itr.output.LastEvaluatedKey
+			return itr.output.LastEvaluatedKey, fmt.Errorf("dynamo: failed to determine LastEvaluatedKey in query: %w", itr.keyErr)
 		}
 
 		// we can't use the real LEK, so we need to infer the LEK from the last item we saw
 		lek, err := lekify(itr.last, itr.keys)
-		// unfortunately, this API can't return an error so a warning is the best we can do...
-		// this matches old behavior before the LEK was automatically generated
-		// TODO(v2): fix this.
 		if err != nil {
-			itr.query.table.db.log("dynamo: Warning:", err, "Returning a later LastEvaluatedKey.")
-			return itr.output.LastEvaluatedKey
+			return itr.output.LastEvaluatedKey, fmt.Errorf("dynamo: failed to infer LastEvaluatedKey in query: %w", err)
 		}
-		return lek
+		return lek, nil
 	}
-	return nil
+	return nil, nil
 }
 
 // All executes this request and unmarshals all results to out, which must be a pointer to a slice.
-func (q *Query) All(out interface{}) error {
-	ctx, cancel := defaultContext()
-	defer cancel()
-	return q.AllWithContext(ctx, out)
-}
-
-func (q *Query) AllWithContext(ctx context.Context, out interface{}) error {
-	iter := &queryIter{
-		query:     q,
-		unmarshal: unmarshalAppendTo(out),
-		err:       q.err,
-	}
-	for iter.NextWithContext(ctx, out) {
+func (q *Query) All(ctx context.Context, out interface{}) error {
+	iter := q.newIter(unmarshalAppendTo(out))
+	for iter.Next(ctx, out) {
 	}
 	return iter.Err()
 }
 
 // AllWithLastEvaluatedKey executes this request and unmarshals all results to out, which must be a pointer to a slice.
 // This returns a PagingKey you can use with StartFrom to split up results.
-func (q *Query) AllWithLastEvaluatedKey(out interface{}) (PagingKey, error) {
-	ctx, cancel := defaultContext()
-	defer cancel()
-	return q.AllWithLastEvaluatedKeyContext(ctx, out)
-}
-
-func (q *Query) AllWithLastEvaluatedKeyContext(ctx context.Context, out interface{}) (PagingKey, error) {
-	iter := &queryIter{
-		query:     q,
-		unmarshal: unmarshalAppendTo(out),
-		err:       q.err,
+func (q *Query) AllWithLastEvaluatedKey(ctx context.Context, out interface{}) (PagingKey, error) {
+	iter := q.newIter(unmarshalAppendTo(out))
+	for iter.Next(ctx, out) {
 	}
-	for iter.NextWithContext(ctx, out) {
-	}
-	return iter.LastEvaluatedKey(), iter.Err()
+	lek, err := iter.LastEvaluatedKey(ctx)
+	return lek, errors.Join(iter.Err(), err)
 }
 
 // Iter returns a results iterator for this request.
 func (q *Query) Iter() PagingIter {
-	iter := &queryIter{
-		query:     q,
-		unmarshal: unmarshalItem,
-		err:       q.err,
-	}
-
-	return iter
+	return q.newIter(unmarshalItem)
 }
 
 // can we use the get item API?
@@ -535,7 +564,8 @@ func (q *Query) queryInput() *dynamodb.QueryInput {
 	}
 	if q.limit > 0 {
 		if len(q.filters) == 0 {
-			req.Limit = &q.limit
+			limit := int32(min(math.MaxInt32, q.limit))
+			req.Limit = &limit
 		}
 	}
 	if q.searchLimit > 0 {
@@ -555,26 +585,113 @@ func (q *Query) queryInput() *dynamodb.QueryInput {
 		req.ScanIndexForward = (*bool)(q.order)
 	}
 	if q.cc != nil {
-		req.ReturnConsumedCapacity = aws.String(dynamodb.ReturnConsumedCapacityIndexes)
+		req.ReturnConsumedCapacity = types.ReturnConsumedCapacityIndexes
 	}
 	return req
 }
 
-func (q *Query) keyConditions() map[string]*dynamodb.Condition {
-	conds := map[string]*dynamodb.Condition{
-		q.hashKey: {
-			AttributeValueList: []*dynamodb.AttributeValue{q.hashValue},
-			ComparisonOperator: aws.String(string(Equal)),
-		},
+func (q *Query) keyConditions() map[string]types.Condition {
+	conds := map[string]types.Condition{}
+	if len(q.hashKeys) > 0 {
+		for _, kv := range q.hashKeys {
+			conds[kv.Key] = types.Condition{
+				AttributeValueList: []types.AttributeValue{kv.Value},
+				ComparisonOperator: types.ComparisonOperatorEq,
+			}
+		}
+	} else {
+		conds[q.hashKey] = types.Condition{
+			AttributeValueList: []types.AttributeValue{q.hashValue},
+			ComparisonOperator: types.ComparisonOperatorEq,
+		}
 	}
 	if q.rangeKey != "" && q.rangeOp != "" {
-		conds[q.rangeKey] = &dynamodb.Condition{
+		conds[q.rangeKey] = types.Condition{
 			AttributeValueList: q.rangeValues,
-			ComparisonOperator: aws.String(string(q.rangeOp)),
+			ComparisonOperator: types.ComparisonOperator(q.rangeOp),
 		}
 	}
 	return conds
 }
+
+/*
+func (q *Query) keyExpr() (string, error) {
+	// TODO: cache
+	var kexpr strings.Builder
+	if len(q.hashKeys) > 0 {
+		for i, kv := range q.hashKeys {
+			if i > 0 {
+				kexpr.WriteString(" AND ")
+			}
+			kexpr.WriteString(q.subName(kv.Key))
+			kexpr.WriteString(" = ")
+			v, err := q.subValue(kv.Value, flagNone)
+			if err != nil {
+				return "", err
+			}
+			kexpr.WriteString(v)
+		}
+	} else {
+		kexpr.WriteString(q.subName(q.hashKey))
+		kexpr.WriteString(" = ")
+		v, err := q.subValue(q.hashValue, flagNone)
+		if err != nil {
+			return "", err
+		}
+		kexpr.WriteString(v)
+	}
+
+	if q.rangeKey != "" {
+		kexpr.WriteString(" AND ")
+
+		switch q.rangeOp {
+		case Between:
+			if len(q.rangeValues) != 2 {
+				return "", fmt.Errorf("wrong number of arguments for BETWEEN operator in query: %d", len(q.rangeValues))
+			}
+			kexpr.WriteString(q.subName(q.rangeKey))
+			kexpr.WriteString(" BETWEEN ")
+			v1, err := q.subValue(q.rangeValues[0], flagNone)
+			if err != nil {
+				return "", err
+			}
+			kexpr.WriteString(v1)
+			kexpr.WriteString(" AND ")
+			v2, err := q.subValue(q.rangeValues[1], flagNone)
+			if err != nil {
+				return "", err
+			}
+			kexpr.WriteString(v2)
+		case BeginsWith:
+			kexpr.WriteString("begins_with(")
+			kexpr.WriteString(q.subName(q.rangeKey))
+			kexpr.WriteString(", ")
+			v, err := q.subValue(q.rangeValues, flagNone)
+			if err != nil {
+				return "", err
+			}
+			kexpr.WriteString(v)
+			kexpr.WriteString(")")
+		default:
+			kexpr.WriteString(q.subName(q.rangeKey))
+			kexpr.WriteByte(' ')
+			op := q.rangeOp.graphic()
+			if op == "" {
+				return "", fmt.Errorf("invalid range operator: %q", op)
+			}
+			kexpr.WriteString(op)
+			kexpr.WriteByte(' ')
+			v, err := q.subValue(q.rangeValues, flagNone)
+			if err != nil {
+				return "", err
+			}
+			kexpr.WriteString(v)
+		}
+	}
+
+	return kexpr.String(), nil
+}
+*/
 
 func (q *Query) getItemInput() *dynamodb.GetItemInput {
 	req := &dynamodb.GetItemInput{
@@ -589,18 +706,18 @@ func (q *Query) getItemInput() *dynamodb.GetItemInput {
 		req.ProjectionExpression = &q.projection
 	}
 	if q.cc != nil {
-		req.ReturnConsumedCapacity = aws.String(dynamodb.ReturnConsumedCapacityIndexes)
+		req.ReturnConsumedCapacity = types.ReturnConsumedCapacityIndexes
 	}
 	return req
 }
 
-func (q *Query) getTxItem() (*dynamodb.TransactGetItem, error) {
+func (q *Query) getTxItem() (types.TransactGetItem, error) {
 	if !q.canGetItem() {
-		return nil, errors.New("dynamo: transaction Query is too complex; no indexes or filters are allowed")
+		return types.TransactGetItem{}, errors.New("dynamo: transaction Query is too complex; no indexes or filters are allowed")
 	}
 	input := q.getItemInput()
-	return &dynamodb.TransactGetItem{
-		Get: &dynamodb.Get{
+	return types.TransactGetItem{
+		Get: &types.Get{
 			TableName:                input.TableName,
 			Key:                      input.Key,
 			ExpressionAttributeNames: input.ExpressionAttributeNames,
@@ -609,9 +726,14 @@ func (q *Query) getTxItem() (*dynamodb.TransactGetItem, error) {
 	}, nil
 }
 
-func (q *Query) keys() map[string]*dynamodb.AttributeValue {
-	keys := map[string]*dynamodb.AttributeValue{
-		q.hashKey: q.hashValue,
+func (q *Query) keys() Item {
+	keys := make(Item)
+	if len(q.hashKeys) > 0 {
+		for _, kv := range q.hashKeys {
+			keys[kv.Key] = kv.Value
+		}
+	} else {
+		keys[q.hashKey] = q.hashValue
 	}
 	if q.rangeKey != "" && len(q.rangeValues) > 0 {
 		keys[q.rangeKey] = q.rangeValues[0]
@@ -619,9 +741,9 @@ func (q *Query) keys() map[string]*dynamodb.AttributeValue {
 	return keys
 }
 
-func (q *Query) keysAndAttribs() *dynamodb.KeysAndAttributes {
-	kas := &dynamodb.KeysAndAttributes{
-		Keys:                     []map[string]*dynamodb.AttributeValue{q.keys()},
+func (q *Query) keysAndAttribs() types.KeysAndAttributes {
+	kas := types.KeysAndAttributes{
+		Keys:                     []Item{q.keys()},
 		ExpressionAttributeNames: q.nameExpr,
 		ConsistentRead:           &q.consistent,
 	}

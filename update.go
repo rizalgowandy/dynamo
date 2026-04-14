@@ -5,22 +5,24 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 // Update represents changes to an existing item.
 // It uses the UpdateItem API.
 // See: http://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_UpdateItem.html
 type Update struct {
-	table      Table
-	returnType string
+	table Table
+
+	returnType types.ReturnValue
+	onCondFail types.ReturnValuesOnConditionCheckFailure
 
 	hashKey   string
-	hashValue *dynamodb.AttributeValue
+	hashValue types.AttributeValue
 
 	rangeKey   string
-	rangeValue *dynamodb.AttributeValue
+	rangeValue types.AttributeValue
 
 	set    []string
 	add    map[string]string
@@ -130,6 +132,26 @@ func (u *Update) SetIfNotExists(path string, value interface{}) *Update {
 	return u
 }
 
+// SetIgnoringNil changes path to the given value only if the value and marshalled value are not nil.
+func (u *Update) SetIgnoringNil(path string, value interface{}) *Update {
+	if value == nil {
+		return u
+	}
+
+	v, err := marshal(value, flagNone)
+	if v == nil && err == nil {
+		return u
+	}
+	u.setError(err)
+
+	path, err = u.escape(path)
+	u.setError(err)
+	expr, err := u.subExpr("🝕 = ?", path, v)
+	u.setError(err)
+	u.set = append(u.set, expr)
+	return u
+}
+
 // SetExpr performs a custom set expression, substituting the args into expr as in filter expressions.
 // See: http://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_UpdateItem.html#DDB-UpdateItem-request-UpdateExpression
 //
@@ -210,19 +232,17 @@ func (u *Update) DeleteFromSet(path string, value interface{}) *Update {
 		u.setError(err)
 		return u
 	}
-	switch {
+	switch t := v.(type) {
 	// ok:
-	case v.NS != nil:
-	case v.SS != nil:
-	case v.BS != nil:
+	case *types.AttributeValueMemberNS, *types.AttributeValueMemberSS, *types.AttributeValueMemberBS:
 
 	// need to box:
-	case v.N != nil:
-		v = &dynamodb.AttributeValue{NS: []*string{v.N}}
-	case v.S != nil:
-		v = &dynamodb.AttributeValue{SS: []*string{v.S}}
-	case v.B != nil:
-		v = &dynamodb.AttributeValue{BS: [][]byte{v.B}}
+	case *types.AttributeValueMemberN:
+		v = &types.AttributeValueMemberNS{Value: []string{t.Value}}
+	case *types.AttributeValueMemberS:
+		v = &types.AttributeValueMemberSS{Value: []string{t.Value}}
+	case *types.AttributeValueMemberB:
+		v = &types.AttributeValueMemberBS{Value: [][]byte{t.Value}}
 
 	default:
 		u.setError(fmt.Errorf("dynamo: Update.DeleteFromSet given unsupported value: %v (%T: %s)", value, value, avTypeName(v)))
@@ -289,31 +309,16 @@ func (u *Update) ConsumedCapacity(cc *ConsumedCapacity) *Update {
 }
 
 // Run executes this update.
-func (u *Update) Run() error {
-	ctx, cancel := defaultContext()
-	defer cancel()
-	return u.RunWithContext(ctx)
-}
-
-// RunWithContext executes this update.
-func (u *Update) RunWithContext(ctx context.Context) error {
-	u.returnType = "NONE"
+func (u *Update) Run(ctx context.Context) error {
+	u.returnType = types.ReturnValueNone
 	_, err := u.run(ctx)
 	return err
 }
 
 // Value executes this update, encoding out with the new value after the update.
 // This is equivalent to ReturnValues = ALL_NEW in the DynamoDB API.
-func (u *Update) Value(out interface{}) error {
-	ctx, cancel := defaultContext()
-	defer cancel()
-	return u.ValueWithContext(ctx, out)
-}
-
-// ValueWithContext executes this update, encoding out with the new value after the update.
-// This is equivalent to ReturnValues = ALL_NEW in the DynamoDB API.
-func (u *Update) ValueWithContext(ctx context.Context, out interface{}) error {
-	u.returnType = "ALL_NEW"
+func (u *Update) Value(ctx context.Context, out interface{}) error {
+	u.returnType = types.ReturnValueAllNew
 	output, err := u.run(ctx)
 	if err != nil {
 		return err
@@ -323,16 +328,8 @@ func (u *Update) ValueWithContext(ctx context.Context, out interface{}) error {
 
 // OldValue executes this update, encoding out with the old value before the update.
 // This is equivalent to ReturnValues = ALL_OLD in the DynamoDB API.
-func (u *Update) OldValue(out interface{}) error {
-	ctx, cancel := defaultContext()
-	defer cancel()
-	return u.OldValueWithContext(ctx, out)
-}
-
-// OldValueWithContext executes this update, encoding out with the old value before the update.
-// This is equivalent to ReturnValues = ALL_OLD in the DynamoDB API.
-func (u *Update) OldValueWithContext(ctx context.Context, out interface{}) error {
-	u.returnType = "ALL_OLD"
+func (u *Update) OldValue(ctx context.Context, out interface{}) error {
+	u.returnType = types.ReturnValueAllOld
 	output, err := u.run(ctx)
 	if err != nil {
 		return err
@@ -342,16 +339,8 @@ func (u *Update) OldValueWithContext(ctx context.Context, out interface{}) error
 
 // OnlyUpdatedValue executes this update, encoding out with only with new values of the attributes that were changed.
 // This is equivalent to ReturnValues = UPDATED_NEW in the DynamoDB API.
-func (u *Update) OnlyUpdatedValue(out interface{}) error {
-	ctx, cancel := defaultContext()
-	defer cancel()
-	return u.OnlyUpdatedValueWithContext(ctx, out)
-}
-
-// OnlyUpdatedValueWithContext executes this update, encoding out with only with new values of the attributes that were changed.
-// This is equivalent to ReturnValues = UPDATED_NEW in the DynamoDB API.
-func (u *Update) OnlyUpdatedValueWithContext(ctx context.Context, out interface{}) error {
-	u.returnType = "UPDATED_NEW"
+func (u *Update) OnlyUpdatedValue(ctx context.Context, out interface{}) error {
+	u.returnType = types.ReturnValueUpdatedNew
 	output, err := u.run(ctx)
 	if err != nil {
 		return err
@@ -361,21 +350,45 @@ func (u *Update) OnlyUpdatedValueWithContext(ctx context.Context, out interface{
 
 // OnlyUpdatedOldValue executes this update, encoding out with only with old values of the attributes that were changed.
 // This is equivalent to ReturnValues = UPDATED_OLD in the DynamoDB API.
-func (u *Update) OnlyUpdatedOldValue(out interface{}) error {
-	ctx, cancel := defaultContext()
-	defer cancel()
-	return u.OnlyUpdatedOldValueWithContext(ctx, out)
-}
-
-// OnlyUpdatedOldValueWithContext executes this update, encoding out with only with old values of the attributes that were changed.
-// This is equivalent to ReturnValues = UPDATED_OLD in the DynamoDB API.
-func (u *Update) OnlyUpdatedOldValueWithContext(ctx context.Context, out interface{}) error {
-	u.returnType = "UPDATED_OLD"
+func (u *Update) OnlyUpdatedOldValue(ctx context.Context, out interface{}) error {
+	u.returnType = types.ReturnValueUpdatedOld
 	output, err := u.run(ctx)
 	if err != nil {
 		return err
 	}
 	return unmarshalItem(output.Attributes, out)
+}
+
+// CurrentValue executes this update.
+// If successful, the return value `wrote` will be true, and the input item will be unmarshaled to `out`.
+//
+// If the update is unsuccessful because of a condition check failure, `wrote` will be false, the current value of the item will be unmarshaled to `out`, and `err` will be nil.
+//
+// If the update is unsuccessful for any other reason, `wrote` will be false and `err` will be non-nil.
+//
+// See also: [UnmarshalItemFromCondCheckFailed].
+func (u *Update) CurrentValue(ctx context.Context, out interface{}) (wrote bool, err error) {
+	u.returnType = types.ReturnValueAllNew
+	u.onCondFail = types.ReturnValuesOnConditionCheckFailureAllOld
+	output, err := u.run(ctx)
+	if err != nil {
+		if ok, err := UnmarshalItemFromCondCheckFailed(err, out); ok {
+			return false, err
+		}
+		return false, err
+	}
+	return true, unmarshalItem(output.Attributes, out)
+}
+
+// IncludeAllItemsInCondCheckFail specifies whether an item update that fails its condition check should include the item itself in the error.
+// Such items can be extracted using [UnmarshalItemFromCondCheckFailed] for single updates, or [UnmarshalItemsFromTxCondCheckFailed] for write transactions.
+func (u *Update) IncludeItemInCondCheckFail(enabled bool) *Update {
+	if enabled {
+		u.onCondFail = types.ReturnValuesOnConditionCheckFailureAllOld
+	} else {
+		u.onCondFail = types.ReturnValuesOnConditionCheckFailureNone
+	}
+	return u
 }
 
 func (u *Update) run(ctx context.Context) (*dynamodb.UpdateItemOutput, error) {
@@ -387,11 +400,12 @@ func (u *Update) run(ctx context.Context) (*dynamodb.UpdateItemOutput, error) {
 	var output *dynamodb.UpdateItemOutput
 	err := u.table.db.retry(ctx, func() error {
 		var err error
-		output, err = u.table.db.client.UpdateItemWithContext(ctx, input)
+		output, err = u.table.db.client.UpdateItem(ctx, input)
+		u.cc.incRequests()
 		return err
 	})
-	if u.cc != nil {
-		addConsumedCapacity(u.cc, output.ConsumedCapacity)
+	if output != nil {
+		u.cc.add(output.ConsumedCapacity)
 	}
 	return output, err
 }
@@ -403,38 +417,39 @@ func (u *Update) updateInput() *dynamodb.UpdateItemInput {
 		UpdateExpression:          u.updateExpr(),
 		ExpressionAttributeNames:  u.nameExpr,
 		ExpressionAttributeValues: u.valueExpr,
-		ReturnValues:              &u.returnType,
+		ReturnValues:              u.returnType,
 	}
 	if u.condition != "" {
 		input.ConditionExpression = &u.condition
+		input.ReturnValuesOnConditionCheckFailure = u.onCondFail
 	}
 	if u.cc != nil {
-		input.ReturnConsumedCapacity = aws.String(dynamodb.ReturnConsumedCapacityIndexes)
+		input.ReturnConsumedCapacity = types.ReturnConsumedCapacityIndexes
 	}
 	return input
 }
 
-func (u *Update) writeTxItem() (*dynamodb.TransactWriteItem, error) {
+func (u *Update) writeTxItem() (*types.TransactWriteItem, error) {
 	if u.err != nil {
 		return nil, u.err
 	}
 	input := u.updateInput()
-	item := &dynamodb.TransactWriteItem{
-		Update: &dynamodb.Update{
-			TableName:                 input.TableName,
-			Key:                       input.Key,
-			UpdateExpression:          input.UpdateExpression,
-			ExpressionAttributeNames:  input.ExpressionAttributeNames,
-			ExpressionAttributeValues: input.ExpressionAttributeValues,
-			ConditionExpression:       input.ConditionExpression,
-			// TODO: return values
+	item := &types.TransactWriteItem{
+		Update: &types.Update{
+			TableName:                           input.TableName,
+			Key:                                 input.Key,
+			UpdateExpression:                    input.UpdateExpression,
+			ExpressionAttributeNames:            input.ExpressionAttributeNames,
+			ExpressionAttributeValues:           input.ExpressionAttributeValues,
+			ConditionExpression:                 input.ConditionExpression,
+			ReturnValuesOnConditionCheckFailure: input.ReturnValuesOnConditionCheckFailure,
 		},
 	}
 	return item, nil
 }
 
-func (u *Update) key() map[string]*dynamodb.AttributeValue {
-	key := map[string]*dynamodb.AttributeValue{
+func (u *Update) key() Item {
+	key := Item{
 		u.hashKey: u.hashValue,
 	}
 	if u.rangeKey != "" {

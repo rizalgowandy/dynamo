@@ -4,14 +4,14 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 var itemEncodeOnlyTests = []struct {
 	name string
 	in   interface{}
-	out  map[string]*dynamodb.AttributeValue
+	out  Item
 }{
 	{
 		name: "omitemptyelem",
@@ -26,10 +26,10 @@ var itemEncodeOnlyTests = []struct {
 			M:     map[string]string{"test": ""},
 			Other: true,
 		},
-		out: map[string]*dynamodb.AttributeValue{
-			"L":     {L: []*dynamodb.AttributeValue{}},
-			"M":     {M: map[string]*dynamodb.AttributeValue{}},
-			"Other": {BOOL: aws.Bool(true)},
+		out: Item{
+			"L":     &types.AttributeValueMemberL{Value: []types.AttributeValue{}},
+			"M":     &types.AttributeValueMemberM{Value: Item{}},
+			"Other": &types.AttributeValueMemberBOOL{Value: true},
 		},
 	},
 	{
@@ -43,8 +43,8 @@ var itemEncodeOnlyTests = []struct {
 			M:     map[string]string{"test": ""},
 			Other: true,
 		},
-		out: map[string]*dynamodb.AttributeValue{
-			"Other": {BOOL: aws.Bool(true)},
+		out: Item{
+			"Other": &types.AttributeValueMemberBOOL{Value: (true)},
 		},
 	},
 	{
@@ -62,14 +62,20 @@ var itemEncodeOnlyTests = []struct {
 				},
 			},
 		},
-		out: map[string]*dynamodb.AttributeValue{
-			"M": {M: map[string]*dynamodb.AttributeValue{
-				"struct": {M: map[string]*dynamodb.AttributeValue{
-					"InnerMap": {M: map[string]*dynamodb.AttributeValue{
-						// expected empty inside
-					}},
-				}},
-			}},
+		out: Item{
+			"M": &types.AttributeValueMemberM{
+				Value: Item{
+					"struct": &types.AttributeValueMemberM{
+						Value: Item{
+							"InnerMap": &types.AttributeValueMemberM{
+								Value: Item{
+									// expected empty inside
+								},
+							},
+						},
+					},
+				},
+			},
 		},
 	},
 	{
@@ -83,8 +89,20 @@ var itemEncodeOnlyTests = []struct {
 			private:  1337,
 			private2: new(int),
 		},
-		out: map[string]*dynamodb.AttributeValue{
-			"Public": {N: aws.String("555")},
+		out: Item{
+			"Public": &types.AttributeValueMemberN{Value: ("555")},
+		},
+	},
+	{
+		name: "nil exported pointer embedded struct",
+		in: struct {
+			ID string
+			*ExportedEmbedded
+		}{
+			ID: "abc",
+		},
+		out: Item{
+			"ID": &types.AttributeValueMemberS{Value: "abc"},
 		},
 	},
 }
@@ -131,5 +149,59 @@ func TestMarshalItemAsymmetric(t *testing.T) {
 				t.Errorf("%s: bad result: %#v ≠ %#v", tc.name, item, tc.out)
 			}
 		})
+	}
+}
+
+type isValue_Kind interface {
+	isValue_Kind()
+}
+
+type myStruct struct {
+	OK    bool
+	Value isValue_Kind
+}
+
+func (ms *myStruct) MarshalDynamoItem() (map[string]types.AttributeValue, error) {
+	world := "world"
+	return map[string]types.AttributeValue{
+		"hello": &types.AttributeValueMemberS{Value: world},
+	}, nil
+}
+
+func (ms *myStruct) UnmarshalDynamoItem(item map[string]types.AttributeValue) error {
+	hello := item["hello"]
+	if h, ok := hello.(*types.AttributeValueMemberS); ok && h.Value == "world" {
+		ms.OK = true
+	} else {
+		ms.OK = false
+	}
+	return nil
+}
+
+var _ ItemMarshaler = &myStruct{}
+var _ ItemUnmarshaler = &myStruct{}
+
+func TestMarshalItemBypass(t *testing.T) {
+	something := &myStruct{}
+	got, err := MarshalItem(something)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	world := "world"
+	expect := map[string]types.AttributeValue{
+		"hello": &types.AttributeValueMemberS{Value: world},
+	}
+	if !reflect.DeepEqual(got, expect) {
+		t.Error("bad marshal. want:", expect, "got:", got)
+	}
+
+	var dec myStruct
+	err = UnmarshalItem(got, &dec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !dec.OK {
+		t.Error("bad unmarshal")
 	}
 }

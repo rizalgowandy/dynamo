@@ -1,6 +1,7 @@
 package dynamo
 
 import (
+	"context"
 	"testing"
 )
 
@@ -8,9 +9,10 @@ func TestDescribeTTL(t *testing.T) {
 	if testDB == nil {
 		t.Skip(offlineSkipMsg)
 	}
-	table := testDB.Table(testTable)
+	table := testDB.Table(testTableWidgets)
+	ctx := context.TODO()
 
-	desc, err := table.DescribeTTL().Run()
+	desc, err := table.DescribeTTL().Run(ctx)
 	if err != nil {
 		t.Error(err)
 		return

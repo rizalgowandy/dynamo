@@ -1,6 +1,7 @@
 package dynamo
 
 import (
+	"context"
 	"reflect"
 	"testing"
 	"time"
@@ -10,7 +11,8 @@ func TestDelete(t *testing.T) {
 	if testDB == nil {
 		t.Skip(offlineSkipMsg)
 	}
-	table := testDB.Table(testTable)
+	ctx := context.TODO()
+	table := testDB.Table(testTableWidgets)
 
 	// first, add an item to delete later
 	item := widget{
@@ -21,25 +23,29 @@ func TestDelete(t *testing.T) {
 			"color": "octarine",
 		},
 	}
-	err := table.Put(item).Run()
+	err := table.Put(item).Run(ctx)
 	if err != nil {
 		t.Error("unexpected error:", err)
 	}
 
 	// fail to delete it
-	err = table.Delete("UserID", item.UserID).
+	var curr widget
+	wrote, err := table.Delete("UserID", item.UserID).
 		Range("Time", item.Time).
 		If("Meta.'color' = ?", "octarine").
 		If("Msg = ?", "wrong msg").
-		Run()
-	if !IsCondCheckFailed(err) {
-		t.Error("expected ConditionalCheckFailedException, not", err)
+		CurrentValue(ctx, &curr)
+	if wrote {
+		t.Error("wrote should be false")
+	}
+	if !reflect.DeepEqual(curr, item) {
+		t.Errorf("bad value. %#v ≠ %#v", curr, item)
 	}
 
 	// delete it
 	var old widget
 	var cc ConsumedCapacity
-	err = table.Delete("UserID", item.UserID).Range("Time", item.Time).ConsumedCapacity(&cc).OldValue(&old)
+	err = table.Delete("UserID", item.UserID).Range("Time", item.Time).ConsumedCapacity(&cc).OldValue(ctx, &old)
 	if err != nil {
 		t.Error("unexpected error:", err)
 	}

@@ -1,19 +1,22 @@
 package dynamo
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 func TestGetAllCount(t *testing.T) {
 	if testDB == nil {
 		t.Skip(offlineSkipMsg)
 	}
-	table := testDB.Table(testTable)
+	ctx := context.TODO()
+	table := testDB.Table(testTableWidgets)
 
 	// first, add an item to make sure there is at least one
 	item := widget{
@@ -26,7 +29,7 @@ func TestGetAllCount(t *testing.T) {
 		},
 		StrPtr: new(string),
 	}
-	err := table.Put(item).Run()
+	err := table.Put(item).Run(ctx)
 	if err != nil {
 		t.Error("unexpected error:", err)
 	}
@@ -37,8 +40,8 @@ func TestGetAllCount(t *testing.T) {
 			"#meta": "Meta",
 			"#foo":  "foo",
 		}),
-		AttributeValues: map[string]*dynamodb.AttributeValue{
-			":bar": {S: aws.String("bar")},
+		AttributeValues: Item{
+			":bar": &types.AttributeValueMemberS{Value: "bar"},
 		},
 	}
 
@@ -51,7 +54,7 @@ func TestGetAllCount(t *testing.T) {
 		Filter("StrPtr = ?", "").
 		Filter("?", lit).
 		ConsumedCapacity(&cc1).
-		All(&result)
+		All(ctx, &result)
 	if err != nil {
 		t.Error("unexpected error:", err)
 	}
@@ -62,7 +65,7 @@ func TestGetAllCount(t *testing.T) {
 		Filter("StrPtr = ?", "").
 		Filter("$", lit). // both $ and ? are OK for literals
 		ConsumedCapacity(&cc2).
-		Count()
+		Count(ctx)
 	if err != nil {
 		t.Error("unexpected error:", err)
 	}
@@ -91,7 +94,7 @@ func TestGetAllCount(t *testing.T) {
 
 	// query specifically against the inserted item (using GetItem)
 	var one widget
-	err = table.Get("UserID", 42).Range("Time", Equal, item.Time).Consistent(true).One(&one)
+	err = table.Get("UserID", 42).Range("Time", Equal, item.Time).Consistent(true).One(ctx, &one)
 	if err != nil {
 		t.Error("unexpected error:", err)
 	}
@@ -101,12 +104,36 @@ func TestGetAllCount(t *testing.T) {
 
 	// query specifically against the inserted item (using Query)
 	one = widget{}
-	err = table.Get("UserID", 42).Range("Time", Equal, item.Time).Filter("Msg = ?", item.Msg).Filter("StrPtr = ?", "").Consistent(true).One(&one)
+	err = table.Get("UserID", 42).Range("Time", Equal, item.Time).Filter("Msg = ?", item.Msg).Filter("StrPtr = ?", "").Consistent(true).One(ctx, &one)
 	if err != nil {
 		t.Error("unexpected error:", err)
 	}
 	if !reflect.DeepEqual(one, item) {
 		t.Errorf("bad result for get one. %v ≠ %v", one, item)
+	}
+
+	// trigger ErrTooMany
+	one = widget{}
+	err = table.Get("UserID", 42).Range("Time", Greater, "0").Consistent(true).One(ctx, &one)
+	if !errors.Is(err, ErrTooMany) {
+		t.Errorf("bad error from get one. %v ≠ %v", err, ErrTooMany)
+	}
+
+	// suppress ErrTooMany with Limit(1)
+	one = widget{}
+	err = table.Get("UserID", 42).Range("Time", Greater, "0").Consistent(true).Limit(1).One(ctx, &one)
+	if err != nil {
+		t.Error("unexpected error:", err)
+	}
+	if one.UserID == 0 {
+		t.Errorf("bad result for get one: %v", one)
+	}
+
+	// trigger ErrNotFound via SearchLimit + Filter + One
+	one = widget{}
+	err = table.Get("UserID", 42).Range("Time", Greater, "0").Filter("Msg = ?", item.Msg).Consistent(true).SearchLimit(1).One(ctx, &one)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("bad error from get one. %v ≠ %v", err, ErrNotFound)
 	}
 
 	// GetItem + Project
@@ -115,7 +142,7 @@ func TestGetAllCount(t *testing.T) {
 		UserID: item.UserID,
 		Time:   item.Time,
 	}
-	err = table.Get("UserID", 42).Range("Time", Equal, item.Time).Project("UserID", "Time").Consistent(true).One(&one)
+	err = table.Get("UserID", 42).Range("Time", Equal, item.Time).Project("UserID", "Time").Consistent(true).One(ctx, &one)
 	if err != nil {
 		t.Error("unexpected error:", err)
 	}
@@ -133,7 +160,7 @@ func TestGetAllCount(t *testing.T) {
 			"animal.cow": "moo",
 		},
 	}
-	err = table.Get("UserID", 42).Range("Time", Equal, item.Time).ProjectExpr("UserID, $, Meta.foo, Meta.$", "Time", "animal.cow").Consistent(true).One(&one)
+	err = table.Get("UserID", 42).Range("Time", Equal, item.Time).ProjectExpr("UserID, $, Meta.foo, Meta.$", "Time", "animal.cow").Consistent(true).One(ctx, &one)
 	if err != nil {
 		t.Error("unexpected error:", err)
 	}
@@ -146,7 +173,8 @@ func TestQueryPaging(t *testing.T) {
 	if testDB == nil {
 		t.Skip(offlineSkipMsg)
 	}
-	table := testDB.Table(testTable)
+	ctx := context.TODO()
+	table := testDB.Table(testTableWidgets)
 
 	widgets := []interface{}{
 		widget{
@@ -166,7 +194,7 @@ func TestQueryPaging(t *testing.T) {
 		},
 	}
 
-	if _, err := table.Batch().Write().Put(widgets...).Run(); err != nil {
+	if _, err := table.Batch().Write().Put(widgets...).Run(ctx); err != nil {
 		t.Error("couldn't write paging prep data", err)
 		return
 	}
@@ -174,18 +202,22 @@ func TestQueryPaging(t *testing.T) {
 	itr := table.Get("UserID", 1969).SearchLimit(1).Iter()
 	for i := 0; i < len(widgets); i++ {
 		var w widget
-		itr.Next(&w)
+		itr.Next(ctx, &w)
 		if !reflect.DeepEqual(w, widgets[i]) {
 			t.Error("bad result:", w, "≠", widgets[i])
 		}
 		if itr.Err() != nil {
 			t.Error("unexpected error", itr.Err())
 		}
-		more := itr.Next(&w)
+		more := itr.Next(ctx, &w)
 		if more {
 			t.Error("unexpected more", more)
 		}
-		itr = table.Get("UserID", 1969).StartFrom(itr.LastEvaluatedKey()).SearchLimit(1).Iter()
+		lek, err := itr.LastEvaluatedKey(context.Background())
+		if err != nil {
+			t.Error("LEK error", err)
+		}
+		itr = table.Get("UserID", 1969).StartFrom(lek).SearchLimit(1).Iter()
 	}
 }
 
@@ -193,7 +225,8 @@ func TestQueryMagicLEK(t *testing.T) {
 	if testDB == nil {
 		t.Skip(offlineSkipMsg)
 	}
-	table := testDB.Table(testTable)
+	ctx := context.Background()
+	table := testDB.Table(testTableWidgets)
 
 	widgets := []interface{}{
 		widget{
@@ -214,7 +247,7 @@ func TestQueryMagicLEK(t *testing.T) {
 	}
 
 	t.Run("prepare data", func(t *testing.T) {
-		if _, err := table.Batch().Write().Put(widgets...).Run(); err != nil {
+		if _, err := table.Batch().Write().Put(widgets...).Run(ctx); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -223,23 +256,27 @@ func TestQueryMagicLEK(t *testing.T) {
 		itr := table.Get("UserID", 1970).Filter("attribute_exists('Msg')").Limit(1).Iter()
 		for i := 0; i < len(widgets); i++ {
 			var w widget
-			itr.Next(&w)
+			itr.Next(ctx, &w)
 			if !reflect.DeepEqual(w, widgets[i]) {
 				t.Error("bad result:", w, "≠", widgets[i])
 			}
 			if itr.Err() != nil {
 				t.Error("unexpected error", itr.Err())
 			}
-			more := itr.Next(&w)
+			more := itr.Next(ctx, &w)
 			if more {
 				t.Error("unexpected more", more)
 			}
-			itr = table.Get("UserID", 1970).StartFrom(itr.LastEvaluatedKey()).Limit(1).Iter()
+			lek, err := itr.LastEvaluatedKey(context.Background())
+			if err != nil {
+				t.Error("LEK error", lek)
+			}
+			itr = table.Get("UserID", 1970).StartFrom(lek).Limit(1).Iter()
 		}
 	})
 
 	t.Run("table cache", func(t *testing.T) {
-		pk, err := table.primaryKeys(aws.BackgroundContext(), nil, nil, "")
+		pk, err := table.primaryKeys(context.Background(), nil, nil, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -256,18 +293,22 @@ func TestQueryMagicLEK(t *testing.T) {
 		itr := table.Get("Msg", "TestQueryMagicLEK").Index("Msg-Time-index").Filter("UserID = ?", 1970).Limit(1).Iter()
 		for i := 0; i < len(widgets); i++ {
 			var w widget
-			itr.Next(&w)
+			itr.Next(ctx, &w)
 			if !reflect.DeepEqual(w, widgets[i]) {
 				t.Error("bad result:", w, "≠", widgets[i])
 			}
 			if itr.Err() != nil {
 				t.Error("unexpected error", itr.Err())
 			}
-			more := itr.Next(&w)
+			more := itr.Next(ctx, &w)
 			if more {
 				t.Error("unexpected more", more)
 			}
-			itr = table.Get("Msg", "TestQueryMagicLEK").Index("Msg-Time-index").Filter("UserID = ?", 1970).StartFrom(itr.LastEvaluatedKey()).Limit(1).Iter()
+			lek, err := itr.LastEvaluatedKey(context.Background())
+			if err != nil {
+				t.Error("LEK error", err)
+			}
+			itr = table.Get("Msg", "TestQueryMagicLEK").Index("Msg-Time-index").Filter("UserID = ?", 1970).StartFrom(lek).Limit(1).Iter()
 		}
 	})
 }
@@ -276,11 +317,12 @@ func TestQueryBadKeys(t *testing.T) {
 	if testDB == nil {
 		t.Skip(offlineSkipMsg)
 	}
-	table := testDB.Table(testTable)
+	table := testDB.Table(testTableWidgets)
+	ctx := context.Background()
 
 	t.Run("hash key", func(t *testing.T) {
 		var v interface{}
-		err := table.Get("UserID", "").Range("Time", Equal, "123").One(&v)
+		err := table.Get("UserID", "").Range("Time", Equal, "123").One(ctx, &v)
 		if err == nil {
 			t.Error("want error, got", err)
 		}
@@ -288,9 +330,100 @@ func TestQueryBadKeys(t *testing.T) {
 
 	t.Run("range key", func(t *testing.T) {
 		var v interface{}
-		err := table.Get("UserID", 123).Range("Time", Equal, "").One(&v)
+		err := table.Get("UserID", 123).Range("Time", Equal, "").One(ctx, &v)
 		if err == nil {
 			t.Error("want error, got", err)
+		}
+	})
+}
+
+/*
+func TestQueryKeyExpr(t *testing.T) {
+	// if testDB == nil {
+	// 	t.Skip(offlineSkipMsg)
+	// }
+	table := Table{name: "TestDB"}
+	q := table.Get("Test", 1)
+	// q.Range("Foo", Between, "a", "z")
+	q.Range("Foo", BeginsWith, "foo")
+	kexpr, err := q.keyExpr()
+	if err != nil {
+		t.Error(err)
+	}
+	_ = kexpr
+	// t.Fatal(kexpr)
+}
+*/
+
+func TestQueryComposite(t *testing.T) {
+	if testDB == nil {
+		t.Skip(offlineSkipMsg)
+	}
+	table := testDB.Table(testTableWidgets)
+	ctx := context.Background()
+	var times []time.Time
+	{
+		start := time.Date(2025, time.December, 15, 0, 0, 0, 0, time.UTC)
+		for i := range 3 {
+			item := widget{
+				UserID: 67,
+				Time:   start.Add(time.Hour * 24 * time.Duration(i)),
+				Msg:    "first",
+			}
+			times = append(times, item.Time)
+			err := table.Put(item).Run(ctx)
+			if err != nil {
+				t.Error("unexpected error:", err)
+			}
+			item.Msg = "second"
+			err = table.Put(item).Run(ctx)
+			if err != nil {
+				t.Error("unexpected error:", err)
+			}
+		}
+	}
+
+	t.Run("Greater+All", func(t *testing.T) {
+		q := table.GetComposite(map[string]any{
+			"UserID": 67,
+			"Msg":    "second",
+		}).Range("Time", Greater, times[0]).Index("UserID-Msg-Time-index")
+		var ws []widget
+		if err := q.All(ctx, &ws); err != nil {
+			t.Error(err)
+		}
+		if len(ws) != 2 {
+			t.Error("unexpected length of return:", len(ws))
+		}
+	})
+
+	t.Run("iter+LEK", func(t *testing.T) {
+		q := table.GetComposite(map[string]any{
+			"UserID": 67,
+			"Msg":    "second",
+		}).Range("Time", GreaterOrEqual, times[0]).Index("UserID-Msg-Time-index").SearchLimit(1)
+		itr := q.Iter()
+		for i := range times {
+			var w widget
+			itr.Next(ctx, &w)
+			if !w.Time.Equal(times[i]) {
+				t.Error("bad result:", w.Time, "≠", times[i])
+			}
+			if itr.Err() != nil {
+				t.Error("unexpected error", itr.Err())
+			}
+			more := itr.Next(ctx, &w)
+			if more {
+				t.Error("unexpected more", more)
+			}
+			lek, err := itr.LastEvaluatedKey(context.Background())
+			if err != nil {
+				t.Error("LEK error", lek)
+			}
+			itr = table.GetComposite(map[string]any{
+				"UserID": 67,
+				"Msg":    "second",
+			}).StartFrom(lek).Index("UserID-Msg-Time-index").SearchLimit(1).Iter()
 		}
 	})
 }

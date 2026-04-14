@@ -3,17 +3,19 @@ package dynamo
 import (
 	"context"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 // Put is a request to create or replace an item.
 // See: http://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_PutItem.html
 type Put struct {
-	table      Table
-	returnType string
+	table Table
 
-	item map[string]*dynamodb.AttributeValue
+	returnType types.ReturnValue
+	onCondFail types.ReturnValuesOnConditionCheckFailure
+
+	item Item
 	subber
 	condition string
 
@@ -53,32 +55,17 @@ func (p *Put) ConsumedCapacity(cc *ConsumedCapacity) *Put {
 }
 
 // Run executes this put.
-func (p *Put) Run() error {
-	ctx, cancel := defaultContext()
-	defer cancel()
-	return p.RunWithContext(ctx)
-}
-
-// Run executes this put.
-func (p *Put) RunWithContext(ctx context.Context) error {
-	p.returnType = "NONE"
-	_, err := p.run(ctx)
+func (p *Put) Run(ctx context.Context) error {
+	p.returnType = types.ReturnValueNone
+	_, _, err := p.run(ctx)
 	return err
 }
 
 // OldValue executes this put, unmarshaling the previous value into out.
 // Returns ErrNotFound is there was no previous value.
-func (p *Put) OldValue(out interface{}) error {
-	ctx, cancel := defaultContext()
-	defer cancel()
-	return p.OldValueWithContext(ctx, out)
-}
-
-// OldValueWithContext executes this put, unmarshaling the previous value into out.
-// Returns ErrNotFound is there was no previous value.
-func (p *Put) OldValueWithContext(ctx context.Context, out interface{}) error {
-	p.returnType = "ALL_OLD"
-	output, err := p.run(ctx)
+func (p *Put) OldValue(ctx context.Context, out interface{}) error {
+	p.returnType = types.ReturnValueAllOld
+	_, output, err := p.run(ctx)
 	switch {
 	case err != nil:
 		return err
@@ -88,18 +75,52 @@ func (p *Put) OldValueWithContext(ctx context.Context, out interface{}) error {
 	return unmarshalItem(output.Attributes, out)
 }
 
-func (p *Put) run(ctx context.Context) (output *dynamodb.PutItemOutput, err error) {
+// CurrentValue executes this put.
+// If successful, the return value `wrote` will be true, and the input item will be unmarshaled to `out`.
+//
+// If the put is unsuccessful because of a condition check failure, `wrote` will be false, the current value of the item will be unmarshaled to `out`, and `err` will be nil.
+//
+// If the put is unsuccessful for any other reason, `wrote` will be false and `err` will be non-nil.
+//
+// See also: [UnmarshalItemFromCondCheckFailed].
+func (p *Put) CurrentValue(ctx context.Context, out interface{}) (wrote bool, err error) {
+	p.returnType = types.ReturnValueNone
+	p.onCondFail = types.ReturnValuesOnConditionCheckFailureAllOld
+	item, _, err := p.run(ctx)
+	wrote = err == nil
+	if err != nil {
+		_, err = UnmarshalItemFromCondCheckFailed(err, out)
+		return
+	}
+	err = unmarshalItem(item, out)
+	return
+}
+
+// IncludeAllItemsInCondCheckFail specifies whether an item put that fails its condition check should include the item itself in the error.
+// Such items can be extracted using [UnmarshalItemFromCondCheckFailed] for single puts, or [UnmarshalItemsFromTxCondCheckFailed] for write transactions.
+func (p *Put) IncludeItemInCondCheckFail(enabled bool) *Put {
+	if enabled {
+		p.onCondFail = types.ReturnValuesOnConditionCheckFailureAllOld
+	} else {
+		p.onCondFail = types.ReturnValuesOnConditionCheckFailureNone
+	}
+	return p
+}
+
+func (p *Put) run(ctx context.Context) (item Item, output *dynamodb.PutItemOutput, err error) {
 	if p.err != nil {
-		return nil, p.err
+		return nil, nil, p.err
 	}
 
 	req := p.input()
+	item = req.Item
 	p.table.db.retry(ctx, func() error {
-		output, err = p.table.db.client.PutItemWithContext(ctx, req)
+		output, err = p.table.db.client.PutItem(ctx, req)
+		p.cc.incRequests()
 		return err
 	})
-	if p.cc != nil {
-		addConsumedCapacity(p.cc, output.ConsumedCapacity)
+	if output != nil {
+		p.cc.add(output.ConsumedCapacity)
 	}
 	return
 }
@@ -108,33 +129,33 @@ func (p *Put) input() *dynamodb.PutItemInput {
 	input := &dynamodb.PutItemInput{
 		TableName:                 &p.table.name,
 		Item:                      p.item,
-		ReturnValues:              &p.returnType,
+		ReturnValues:              p.returnType,
 		ExpressionAttributeNames:  p.nameExpr,
 		ExpressionAttributeValues: p.valueExpr,
 	}
 	if p.condition != "" {
 		input.ConditionExpression = &p.condition
+		input.ReturnValuesOnConditionCheckFailure = p.onCondFail
 	}
 	if p.cc != nil {
-		input.ReturnConsumedCapacity = aws.String(dynamodb.ReturnConsumedCapacityIndexes)
+		input.ReturnConsumedCapacity = types.ReturnConsumedCapacityIndexes
 	}
 	return input
 }
 
-func (p *Put) writeTxItem() (*dynamodb.TransactWriteItem, error) {
+func (p *Put) writeTxItem() (*types.TransactWriteItem, error) {
 	if p.err != nil {
 		return nil, p.err
 	}
 	input := p.input()
-	item := &dynamodb.TransactWriteItem{
-		Put: &dynamodb.Put{
-			TableName:                 input.TableName,
-			Item:                      input.Item,
-			ExpressionAttributeNames:  input.ExpressionAttributeNames,
-			ExpressionAttributeValues: input.ExpressionAttributeValues,
-			ConditionExpression:       input.ConditionExpression,
-			// TODO: add support when aws-sdk-go updates
-			// ReturnValuesOnConditionCheckFailure: aws.String(dynamodb.ReturnValuesOnConditionCheckFailureAllOld),
+	item := &types.TransactWriteItem{
+		Put: &types.Put{
+			TableName:                           input.TableName,
+			Item:                                input.Item,
+			ExpressionAttributeNames:            input.ExpressionAttributeNames,
+			ExpressionAttributeValues:           input.ExpressionAttributeValues,
+			ConditionExpression:                 input.ConditionExpression,
+			ReturnValuesOnConditionCheckFailure: input.ReturnValuesOnConditionCheckFailure,
 		},
 	}
 	return item, nil

@@ -6,9 +6,8 @@ import (
 	"reflect"
 	"sync"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 var typeCache sync.Map // unmarshalKey → *typedef
@@ -16,17 +15,20 @@ var typeCache sync.Map // unmarshalKey → *typedef
 type typedef struct {
 	decoders map[unmarshalKey]decodeFunc
 	fields   []structField
+	info     *structInfo
 }
 
 func newTypedef(rt reflect.Type) (*typedef, error) {
 	def := &typedef{
 		decoders: make(map[unmarshalKey]decodeFunc),
+		// encoders: make(map[encodeKey]encodeFunc),
 	}
 	err := def.init(rt)
 	return def, err
 }
 
 func (def *typedef) init(rt reflect.Type) error {
+	rt0 := rt
 	for rt.Kind() == reflect.Pointer {
 		rt = rt.Elem()
 	}
@@ -37,9 +39,20 @@ func (def *typedef) init(rt reflect.Type) error {
 		return nil
 	}
 
-	var err error
-	def.fields, err = structFields(rt)
-	return err
+	// skip visiting struct fields if encoding will be bypassed by a custom marshaler
+	if shouldBypassEncodeItem(rt0) || shouldBypassEncodeItem(rt) {
+		return nil
+	}
+
+	info, err := def.structInfo(rt, nil)
+	if err != nil {
+		return err
+	}
+	for _, field := range info.fields {
+		def.fields = append(def.fields, *field)
+	}
+	def.info = info
+	return nil
 }
 
 func registerTypedef(gotype reflect.Type, def *typedef) *typedef {
@@ -88,7 +101,7 @@ func (def *typedef) encodeItem(rv reflect.Value) (Item, error) {
 	case reflect.Struct:
 		return encodeItem(def.fields, rv)
 	case reflect.Map:
-		enc, err := encodeMapM(rv.Type(), flagNone)
+		enc, err := def.encodeMapM(rv.Type(), flagNone, def.info)
 		if err != nil {
 			return nil, err
 		}
@@ -96,29 +109,29 @@ func (def *typedef) encodeItem(rv reflect.Value) (Item, error) {
 		if err != nil {
 			return nil, err
 		}
-		return av.M, err
+		return av.(*types.AttributeValueMemberM).Value, err
 	}
 	return encodeItem(def.fields, rv)
 }
 
-func (def *typedef) encodeItemBypass(in any) (item map[string]*dynamodb.AttributeValue, err error) {
+func (def *typedef) encodeItemBypass(in any) (item map[string]types.AttributeValue, err error) {
 	switch x := in.(type) {
-	case map[string]*dynamodb.AttributeValue:
+	case map[string]types.AttributeValue:
 		item = x
-	case *map[string]*dynamodb.AttributeValue:
+	case *map[string]types.AttributeValue:
 		if x == nil {
 			return nil, fmt.Errorf("item to encode is nil")
 		}
 		item = *x
 	case awsEncoder:
-		item, err = dynamodbattribute.MarshalMap(x.iface)
+		item, err = attributevalue.MarshalMap(x.iface)
 	case ItemMarshaler:
 		item, err = x.MarshalDynamoItem()
 	}
 	return
 }
 
-func (def *typedef) decodeItem(item map[string]*dynamodb.AttributeValue, outv reflect.Value) error {
+func (def *typedef) decodeItem(item map[string]types.AttributeValue, outv reflect.Value) error {
 	out := outv
 	outv = indirectPtr(outv)
 	if shouldBypassDecodeItem(outv.Type()) {
@@ -136,36 +149,36 @@ func (def *typedef) decodeItem(item map[string]*dynamodb.AttributeValue, outv re
 	// debugf("decode item: %v -> %T(%v)", item, out, out)
 	switch outv.Kind() {
 	case reflect.Struct:
-		return decodeStruct(def, flagNone, &dynamodb.AttributeValue{M: item}, outv)
+		return decodeStruct(def, flagNone, &types.AttributeValueMemberM{Value: item}, outv)
 	case reflect.Map:
-		return def.decodeAttr(flagNone, &dynamodb.AttributeValue{M: item}, outv)
+		return def.decodeAttr(flagNone, &types.AttributeValueMemberM{Value: item}, outv)
 	}
 
 bad:
 	return fmt.Errorf("dynamo: cannot unmarshal item into type %v (must be a pointer to a map or struct, or a supported interface)", out.Type())
 }
 
-func (def *typedef) decodeItemBypass(item map[string]*dynamodb.AttributeValue, out any) error {
+func (def *typedef) decodeItemBypass(item Item, out any) error {
 	switch x := out.(type) {
-	case *map[string]*dynamodb.AttributeValue:
+	case *Item:
 		*x = item
 		return nil
 	case awsEncoder:
-		return dynamodbattribute.UnmarshalMap(item, x.iface)
+		return attributevalue.UnmarshalMap(item, x.iface)
 	case ItemUnmarshaler:
 		return x.UnmarshalDynamoItem(item)
 	}
 	return nil
 }
 
-func (def *typedef) decodeAttr(flags encodeFlags, av *dynamodb.AttributeValue, rv reflect.Value) error {
+func (def *typedef) decodeAttr(flags encodeFlags, av types.AttributeValue, rv reflect.Value) error {
 	if !rv.IsValid() || av == nil {
 		return nil
 	}
 
 	// debugf("decodeAttr: %v(%v) <- %v", rv.Type(), rv, av)
 
-	if av.NULL != nil {
+	if _, isNull := av.(*types.AttributeValueMemberNULL); isNull {
 		return decodeNull(def, flags, av, rv)
 	}
 
@@ -199,7 +212,7 @@ retry:
 	return fmt.Errorf("dynamo: cannot unmarshal %s attribute value into type %s", avTypeName(av), rv.Type().String())
 }
 
-func (def *typedef) decodeType(key unmarshalKey, flags encodeFlags, av *dynamodb.AttributeValue, rv reflect.Value) (bool, error) {
+func (def *typedef) decodeType(key unmarshalKey, flags encodeFlags, av types.AttributeValue, rv reflect.Value) (bool, error) {
 	do, ok := def.decoders[key]
 	if !ok {
 		return false, nil
@@ -230,33 +243,83 @@ func (def *typedef) learn(rt reflect.Type) {
 	}
 	for {
 		switch try {
-		case rtypeAttr:
-			def.handle(this(shapeAny), decode2(func(dst *dynamodb.AttributeValue, src *dynamodb.AttributeValue) error {
-				*dst = *src
+		case rtypeAttrB:
+			def.handle(this(shapeB), decode2(func(dst *types.AttributeValueMemberB, src types.AttributeValue) error {
+				*dst = *src.(*types.AttributeValueMemberB)
 				return nil
 			}))
-			return
+		case rtypeAttrBS:
+			def.handle(this(shapeBS), decode2(func(dst *types.AttributeValueMemberBS, src types.AttributeValue) error {
+				*dst = *src.(*types.AttributeValueMemberBS)
+				return nil
+			}))
+		case rtypeAttrBOOL:
+			def.handle(this(shapeBOOL), decode2(func(dst *types.AttributeValueMemberBOOL, src types.AttributeValue) error {
+				*dst = *src.(*types.AttributeValueMemberBOOL)
+				return nil
+			}))
+		case rtypeAttrN:
+			def.handle(this(shapeN), decode2(func(dst *types.AttributeValueMemberN, src types.AttributeValue) error {
+				*dst = *src.(*types.AttributeValueMemberN)
+				return nil
+			}))
+		case rtypeAttrS:
+			def.handle(this(shapeS), decode2(func(dst *types.AttributeValueMemberS, src types.AttributeValue) error {
+				*dst = *src.(*types.AttributeValueMemberS)
+				return nil
+			}))
+		case rtypeAttrL:
+			def.handle(this(shapeL), decode2(func(dst *types.AttributeValueMemberL, src types.AttributeValue) error {
+				*dst = *src.(*types.AttributeValueMemberL)
+				return nil
+			}))
+		case rtypeAttrNS:
+			def.handle(this(shapeNS), decode2(func(dst *types.AttributeValueMemberNS, src types.AttributeValue) error {
+				*dst = *src.(*types.AttributeValueMemberNS)
+				return nil
+			}))
+		case rtypeAttrSS:
+			def.handle(this(shapeSS), decode2(func(dst *types.AttributeValueMemberSS, src types.AttributeValue) error {
+				*dst = *src.(*types.AttributeValueMemberSS)
+				return nil
+			}))
+		case rtypeAttrM:
+			def.handle(this(shapeM), decode2(func(dst *types.AttributeValueMemberM, src types.AttributeValue) error {
+				*dst = *src.(*types.AttributeValueMemberM)
+				return nil
+			}))
+		case rtypeAttrNULL:
+			def.handle(this(shapeNULL), decode2(func(dst *types.AttributeValueMemberNULL, src types.AttributeValue) error {
+				*dst = *src.(*types.AttributeValueMemberNULL)
+				return nil
+			}))
+
 		case rtypeTimePtr, rtypeTime:
 			def.handle(this(shapeN), decodeUnixTime)
-			def.handle(this(shapeS), decode2(func(t encoding.TextUnmarshaler, av *dynamodb.AttributeValue) error {
-				return t.UnmarshalText([]byte(*av.S))
+			def.handle(this(shapeS), decode2(func(t encoding.TextUnmarshaler, av types.AttributeValue) error {
+				return t.UnmarshalText([]byte(av.(*types.AttributeValueMemberS).Value))
 			}))
 			return
 		}
 		switch {
+		// case try.Implements(rtypeAttr):
+		// 	def.handle(this(shapeAny), decode2(func(dst types.AttributeValue, src types.AttributeValue) error {
+		// 		*dst = src
+		// 		return nil
+		// 	}))
 		case try.Implements(rtypeUnmarshaler):
-			def.handle(this(shapeAny), decode2(func(t Unmarshaler, av *dynamodb.AttributeValue) error {
+			def.handle(this(shapeAny), decode2(func(t Unmarshaler, av types.AttributeValue) error {
 				return t.UnmarshalDynamo(av)
 			}))
 			return
 		case try.Implements(rtypeAWSUnmarshaler):
-			def.handle(this(shapeAny), decode2(func(t dynamodbattribute.Unmarshaler, av *dynamodb.AttributeValue) error {
+			def.handle(this(shapeAny), decode2(func(t attributevalue.Unmarshaler, av types.AttributeValue) error {
 				return t.UnmarshalDynamoDBAttributeValue(av)
 			}))
 			return
 		case try.Implements(rtypeTextUnmarshaler):
-			def.handle(this(shapeS), decode2(func(t encoding.TextUnmarshaler, av *dynamodb.AttributeValue) error {
-				return t.UnmarshalText([]byte(*av.S))
+			def.handle(this(shapeS), decode2(func(t encoding.TextUnmarshaler, av types.AttributeValue) error {
+				return t.UnmarshalText([]byte(av.(*types.AttributeValueMemberS).Value))
 			}))
 			return
 		}
@@ -304,7 +367,7 @@ func (def *typedef) learn(rt reflect.Type) {
 
 		truthy := truthy(rt)
 		if !truthy.IsValid() {
-			bad := func(_ *typedef, _ encodeFlags, _ *dynamodb.AttributeValue, _ reflect.Value) error {
+			bad := func(_ *typedef, _ encodeFlags, _ types.AttributeValue, _ reflect.Value) error {
 				return fmt.Errorf("dynamo: unmarshal map set: value type must be struct{} or bool, got %v", rt)
 			}
 			def.handle(this(shapeSS), bad)
@@ -388,28 +451,8 @@ type structField struct {
 	isZero func(reflect.Value) bool
 }
 
-func structFields(rt reflect.Type) ([]structField, error) {
-	var fields []structField
-	err := visitTypeFields(rt, nil, nil, func(name string, index []int, flags encodeFlags, vt reflect.Type) error {
-		enc, err := encodeType(vt, flags)
-		if err != nil {
-			return err
-		}
-		field := structField{
-			index:  index,
-			name:   name,
-			flags:  flags,
-			enc:    enc,
-			isZero: isZeroFunc(vt),
-		}
-		fields = append(fields, field)
-		return nil
-	})
-	return fields, err
-}
-
 var (
-	nullAV = &dynamodb.AttributeValue{NULL: aws.Bool(true)}
-	emptyB = &dynamodb.AttributeValue{B: []byte("")}
-	emptyS = &dynamodb.AttributeValue{S: new(string)}
+	nullAV = &types.AttributeValueMemberNULL{Value: true}
+	emptyB = &types.AttributeValueMemberB{Value: []byte("")}
+	emptyS = &types.AttributeValueMemberS{Value: ""}
 )

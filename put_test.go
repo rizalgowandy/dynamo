@@ -1,18 +1,20 @@
 package dynamo
 
 import (
+	"context"
 	"reflect"
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go-v2/aws"
 )
 
 func TestPut(t *testing.T) {
 	if testDB == nil {
 		t.Skip(offlineSkipMsg)
 	}
-	table := testDB.Table(testTable)
+	table := testDB.Table(testTableWidgets)
+	ctx := context.TODO()
 
 	type widget2 struct {
 		widget
@@ -34,7 +36,7 @@ func TestPut(t *testing.T) {
 		List: []*string{},
 	}
 
-	err := table.Put(item).Run()
+	err := table.Put(item).Run(ctx)
 	if err != nil {
 		t.Error("unexpected error:", err)
 	}
@@ -53,7 +55,7 @@ func TestPut(t *testing.T) {
 	}
 	var oldValue widget2
 	var cc ConsumedCapacity
-	err = table.Put(newItem).ConsumedCapacity(&cc).OldValue(&oldValue)
+	err = table.Put(newItem).ConsumedCapacity(&cc).OldValue(ctx, &oldValue)
 	if err != nil {
 		t.Error("unexpected error:", err)
 	}
@@ -62,22 +64,48 @@ func TestPut(t *testing.T) {
 		t.Errorf("bad old value. %#v ≠ %#v", oldValue, item)
 	}
 
-	if cc.Total < 1 || cc.Table < 1 || cc.TableName != testTable {
+	if cc.Total < 1 || cc.Table < 1 || cc.TableName != testTableWidgets {
 		t.Errorf("bad consumed capacity: %#v", cc)
 	}
 
 	// putting the same item: this should fail
-	err = table.Put(newItem).If("attribute_not_exists(UserID)").If("attribute_not_exists('Time')").Run()
-	if !IsCondCheckFailed(err) {
-		t.Error("expected ConditionalCheckFailedException, not", err)
-	}
+	t.Run("UnmarshalItemFromCondCheckFailed", func(t *testing.T) {
+		err := table.Put(newItem).
+			If("attribute_not_exists(UserID)").
+			If("attribute_not_exists('Time')").
+			IncludeItemInCondCheckFail(true).Run(ctx)
+		if !IsCondCheckFailed(err) {
+			t.Error("expected ConditionalCheckFailedException, not", err)
+		}
+		var curr widget2
+		if match, err := UnmarshalItemFromCondCheckFailed(err, &curr); !match || err != nil {
+			t.Error("bad match:", match, err)
+		}
+		if curr.Msg != newItem.Msg {
+			t.Errorf("bad cond check fail value. %#v ≠ %#v", curr, newItem)
+		}
+	})
+	t.Run("CurrentValue", func(t *testing.T) {
+		var curr widget2
+		wrote, err := table.Put(newItem).If("attribute_not_exists(UserID)").If("attribute_not_exists('Time')").CurrentValue(ctx, &curr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if wrote {
+			t.Error("wrote should be false")
+		}
+		if curr.Msg != newItem.Msg {
+			t.Errorf("bad cond check fail value. %#v ≠ %#v", curr, newItem)
+		}
+	})
 }
 
 func TestPutAndQueryAWSEncoding(t *testing.T) {
 	if testDB == nil {
 		t.Skip(offlineSkipMsg)
 	}
-	table := testDB.Table(testTable)
+	table := testDB.Table(testTableWidgets)
+	ctx := context.TODO()
 
 	type awsWidget struct {
 		XUserID int               `dynamodbav:"UserID"`
@@ -98,13 +126,13 @@ func TestPutAndQueryAWSEncoding(t *testing.T) {
 		XMsg:    "hello world",
 	}
 
-	err = table.Put(AWSEncoding(item)).Run()
+	err = table.Put(AWSEncoding(item)).Run(ctx)
 	if err != nil {
 		t.Error(err)
 	}
 
 	var result awsWidget
-	err = table.Get("UserID", item.XUserID).Range("Time", Equal, item.XTime).Consistent(true).One(AWSEncoding(&result))
+	err = table.Get("UserID", item.XUserID).Range("Time", Equal, item.XTime).Consistent(true).One(ctx, AWSEncoding(&result))
 	if err != nil {
 		t.Error(err)
 	}
@@ -113,7 +141,7 @@ func TestPutAndQueryAWSEncoding(t *testing.T) {
 	}
 
 	var list []awsWidget
-	err = table.Get("UserID", item.XUserID).Consistent(true).All(AWSEncoding(&list))
+	err = table.Get("UserID", item.XUserID).Consistent(true).All(ctx, AWSEncoding(&list))
 	if err != nil {
 		t.Error(err)
 	}

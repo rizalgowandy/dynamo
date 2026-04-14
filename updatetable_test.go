@@ -1,6 +1,7 @@
 package dynamo
 
 import (
+	"context"
 	"testing"
 )
 
@@ -9,7 +10,8 @@ func _TestUpdateTable(t *testing.T) {
 	if testDB == nil {
 		t.Skip(offlineSkipMsg)
 	}
-	table := testDB.Table(testTable)
+	table := testDB.Table(testTableWidgets)
+	ctx := context.TODO()
 
 	desc, err := table.UpdateTable().CreateIndex(Index{
 		Name:              "test123",
@@ -23,7 +25,7 @@ func _TestUpdateTable(t *testing.T) {
 			Read:  1,
 			Write: 1,
 		},
-	}).Run()
+	}).Run(ctx)
 
 	// desc, err := table.UpdateTable().DeleteIndex("test123").Run()
 
@@ -32,8 +34,8 @@ func _TestUpdateTable(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	if desc.Name != testTable {
-		t.Error("wrong name:", desc.Name, "≠", testTable)
+	if desc.Name != testTableWidgets {
+		t.Error("wrong name:", desc.Name, "≠", testTableWidgets)
 	}
 	if desc.Status != UpdatingStatus {
 		t.Error("bad status:", desc.Status, "≠", UpdatingStatus)

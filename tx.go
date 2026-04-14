@@ -6,8 +6,9 @@ import (
 	"encoding/hex"
 	"errors"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 // ErrNoInput is returned when APIs that can take multiple inputs are run with zero inputs.
@@ -15,7 +16,7 @@ import (
 var ErrNoInput = errors.New("dynamo: no input items")
 
 type getTxOp interface {
-	getTxItem() (*dynamodb.TransactGetItem, error)
+	getTxItem() (types.TransactGetItem, error)
 }
 
 // GetTx is a transaction to retrieve items.
@@ -60,14 +61,7 @@ func (tx *GetTx) ConsumedCapacity(cc *ConsumedCapacity) *GetTx {
 }
 
 // Run executes this transaction and unmarshals everything specified by GetOne.
-func (tx *GetTx) Run() error {
-	ctx, cancel := defaultContext()
-	defer cancel()
-	return tx.RunWithContext(ctx)
-}
-
-// RunWithContext executes this transaction and unmarshals everything specified by GetOne.
-func (tx *GetTx) RunWithContext(ctx context.Context) error {
+func (tx *GetTx) Run(ctx context.Context) error {
 	input, err := tx.input()
 	if err != nil {
 		return err
@@ -75,10 +69,11 @@ func (tx *GetTx) RunWithContext(ctx context.Context) error {
 	var resp *dynamodb.TransactGetItemsOutput
 	err = tx.db.retry(ctx, func() error {
 		var err error
-		resp, err = tx.db.client.TransactGetItemsWithContext(ctx, input)
+		resp, err = tx.db.client.TransactGetItems(ctx, input)
+		tx.cc.incRequests()
 		if tx.cc != nil && resp != nil {
-			for _, cc := range resp.ConsumedCapacity {
-				addConsumedCapacity(tx.cc, cc)
+			for i := range resp.ConsumedCapacity {
+				tx.cc.add(&resp.ConsumedCapacity[i])
 			}
 		}
 		return err
@@ -107,14 +102,7 @@ func (tx *GetTx) unmarshal(resp *dynamodb.TransactGetItemsOutput) error {
 }
 
 // All executes this transaction and unmarshals every value to out, which must be a pointer to a slice.
-func (tx *GetTx) All(out interface{}) error {
-	ctx, cancel := defaultContext()
-	defer cancel()
-	return tx.AllWithContext(ctx, out)
-}
-
-// AllWithContext executes this transaction and unmarshals every value to out, which must be a pointer to a slice.
-func (tx *GetTx) AllWithContext(ctx context.Context, out interface{}) error {
+func (tx *GetTx) All(ctx context.Context, out interface{}) error {
 	input, err := tx.input()
 	if err != nil {
 		return err
@@ -122,10 +110,11 @@ func (tx *GetTx) AllWithContext(ctx context.Context, out interface{}) error {
 	var resp *dynamodb.TransactGetItemsOutput
 	err = tx.db.retry(ctx, func() error {
 		var err error
-		resp, err = tx.db.client.TransactGetItemsWithContext(ctx, input)
+		resp, err = tx.db.client.TransactGetItems(ctx, input)
+		tx.cc.incRequests()
 		if tx.cc != nil && resp != nil {
-			for _, cc := range resp.ConsumedCapacity {
-				addConsumedCapacity(tx.cc, cc)
+			for i := range resp.ConsumedCapacity {
+				tx.cc.add(&resp.ConsumedCapacity[i])
 			}
 		}
 		return err
@@ -164,13 +153,13 @@ func (tx *GetTx) input() (*dynamodb.TransactGetItemsInput, error) {
 		input.TransactItems = append(input.TransactItems, tgi)
 	}
 	if tx.cc != nil {
-		input.ReturnConsumedCapacity = aws.String(dynamodb.ReturnConsumedCapacityIndexes)
+		input.ReturnConsumedCapacity = types.ReturnConsumedCapacityIndexes
 	}
 	return input, nil
 }
 
 type writeTxOp interface {
-	writeTxItem() (*dynamodb.TransactWriteItem, error)
+	writeTxItem() (*types.TransactWriteItem, error)
 }
 
 // WriteTx is a transaction to delete, put, update, and check items.
@@ -179,11 +168,12 @@ type writeTxOp interface {
 // WriteTx is analogous to TransactWriteItems in DynamoDB's API.
 // See: https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html
 type WriteTx struct {
-	db    *DB
-	items []writeTxOp
-	token string
-	cc    *ConsumedCapacity
-	err   error
+	db         *DB
+	items      []writeTxOp
+	token      string
+	onCondFail types.ReturnValuesOnConditionCheckFailure
+	cc         *ConsumedCapacity
+	err        error
 }
 
 // WriteTx begins a new write transaction.
@@ -214,6 +204,20 @@ func (tx *WriteTx) Update(u *Update) *WriteTx {
 // Check adds a conditional check to this transaction.
 func (tx *WriteTx) Check(check *ConditionCheck) *WriteTx {
 	tx.items = append(tx.items, check)
+	return tx
+}
+
+// IncludeAllItemsInCondCheckFail specifies whether an item write that fails its condition check should include the item itself in the error.
+// Such items can be extracted using [UnmarshalItemsFromTxCondCheckFailed].
+//
+// By default, the individual settings for each item are respected.
+// Calling this will override all individual settings.
+func (tx *WriteTx) IncludeAllItemsInCondCheckFail(enabled bool) *WriteTx {
+	if enabled {
+		tx.onCondFail = types.ReturnValuesOnConditionCheckFailureAllOld
+	} else {
+		tx.onCondFail = types.ReturnValuesOnConditionCheckFailureNone
+	}
 	return tx
 }
 
@@ -259,14 +263,7 @@ func (tx *WriteTx) ConsumedCapacity(cc *ConsumedCapacity) *WriteTx {
 }
 
 // Run executes this transaction.
-func (tx *WriteTx) Run() error {
-	ctx, cancel := defaultContext()
-	defer cancel()
-	return tx.RunWithContext(ctx)
-}
-
-// RunWithContext executes this transaction.
-func (tx *WriteTx) RunWithContext(ctx context.Context) error {
+func (tx *WriteTx) Run(ctx context.Context) error {
 	if tx.err != nil {
 		return tx.err
 	}
@@ -275,10 +272,11 @@ func (tx *WriteTx) RunWithContext(ctx context.Context) error {
 		return err
 	}
 	err = tx.db.retry(ctx, func() error {
-		out, err := tx.db.client.TransactWriteItemsWithContext(ctx, input)
-		if tx.cc != nil && out != nil {
-			for _, cc := range out.ConsumedCapacity {
-				addConsumedCapacity(tx.cc, cc)
+		out, err := tx.db.client.TransactWriteItems(ctx, input)
+		tx.cc.incRequests()
+		if out != nil {
+			for i := range out.ConsumedCapacity {
+				tx.cc.add(&out.ConsumedCapacity[i])
 			}
 		}
 		return err
@@ -296,15 +294,32 @@ func (tx *WriteTx) input() (*dynamodb.TransactWriteItemsInput, error) {
 		if err != nil {
 			return nil, err
 		}
-		input.TransactItems = append(input.TransactItems, wti)
+		setTWIReturnType(wti, tx.onCondFail)
+		input.TransactItems = append(input.TransactItems, *wti)
 	}
 	if tx.token != "" {
 		input.ClientRequestToken = aws.String(tx.token)
 	}
 	if tx.cc != nil {
-		input.ReturnConsumedCapacity = aws.String(dynamodb.ReturnConsumedCapacityIndexes)
+		input.ReturnConsumedCapacity = types.ReturnConsumedCapacityIndexes
 	}
 	return input, nil
+}
+
+func setTWIReturnType(wti *types.TransactWriteItem, ret types.ReturnValuesOnConditionCheckFailure) {
+	if ret == "" {
+		return
+	}
+	switch {
+	case wti.ConditionCheck != nil:
+		wti.ConditionCheck.ReturnValuesOnConditionCheckFailure = ret
+	case wti.Delete != nil:
+		wti.Delete.ReturnValuesOnConditionCheckFailure = ret
+	case wti.Put != nil:
+		wti.Put.ReturnValuesOnConditionCheckFailure = ret
+	case wti.Update != nil:
+		wti.Update.ReturnValuesOnConditionCheckFailure = ret
+	}
 }
 
 func (tx *WriteTx) setError(err error) {
@@ -313,7 +328,7 @@ func (tx *WriteTx) setError(err error) {
 	}
 }
 
-func isResponsesEmpty(resps []*dynamodb.ItemResponse) bool {
+func isResponsesEmpty(resps []types.ItemResponse) bool {
 	for _, resp := range resps {
 		if resp.Item != nil {
 			return false

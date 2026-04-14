@@ -6,14 +6,25 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 // special attribute encoders
 var (
-	// *dynamodb.AttributeValue
-	rtypeAttr = reflect.TypeOf((*dynamodb.AttributeValue)(nil))
+	// types.AttributeValue
+	rtypeAttr     = reflect.TypeOf((*types.AttributeValue)(nil)).Elem()
+	rtypeAttrB    = reflect.TypeOf((*types.AttributeValueMemberB)(nil))
+	rtypeAttrBS   = reflect.TypeOf((*types.AttributeValueMemberBS)(nil))
+	rtypeAttrBOOL = reflect.TypeOf((*types.AttributeValueMemberBOOL)(nil))
+	rtypeAttrN    = reflect.TypeOf((*types.AttributeValueMemberN)(nil))
+	rtypeAttrS    = reflect.TypeOf((*types.AttributeValueMemberS)(nil))
+	rtypeAttrL    = reflect.TypeOf((*types.AttributeValueMemberL)(nil))
+	rtypeAttrNS   = reflect.TypeOf((*types.AttributeValueMemberNS)(nil))
+	rtypeAttrSS   = reflect.TypeOf((*types.AttributeValueMemberSS)(nil))
+	rtypeAttrM    = reflect.TypeOf((*types.AttributeValueMemberM)(nil))
+	rtypeAttrNULL = reflect.TypeOf((*types.AttributeValueMemberNULL)(nil))
+
 	// *time.Time
 	rtypeTimePtr = reflect.TypeOf((*time.Time)(nil))
 	// time.Time
@@ -22,14 +33,14 @@ var (
 	// Unmarshaler
 	rtypeUnmarshaler = reflect.TypeOf((*Unmarshaler)(nil)).Elem()
 	// dynamodbattribute.Unmarshaler
-	rtypeAWSUnmarshaler = reflect.TypeOf((*dynamodbattribute.Unmarshaler)(nil)).Elem()
+	rtypeAWSUnmarshaler = reflect.TypeOf((*attributevalue.Unmarshaler)(nil)).Elem()
 	// encoding.TextUnmarshaler
 	rtypeTextUnmarshaler = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
 
 	// Marshaler
 	rtypeMarshaler = reflect.TypeOf((*Marshaler)(nil)).Elem()
-	// dynamodbattribute.Marshaler
-	rtypeAWSMarshaler = reflect.TypeOf((*dynamodbattribute.Marshaler)(nil)).Elem()
+	// attributevalue.Marshaler
+	rtypeAWSMarshaler = reflect.TypeOf((*attributevalue.Marshaler)(nil)).Elem()
 	// encoding.TextMarshaler
 	rtypeTextMarshaler = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
 
@@ -41,7 +52,7 @@ var (
 
 // special item encoders
 var (
-	rtypeItemPtr         = reflect.TypeOf((*map[string]*dynamodb.AttributeValue)(nil))
+	rtypeItemPtr         = reflect.TypeOf((*map[string]types.AttributeValue)(nil))
 	rtypeItem            = rtypeItemPtr.Elem()
 	rtypeItemUnmarshaler = reflect.TypeOf((*ItemUnmarshaler)(nil)).Elem()
 	rtypeItemMarshaler   = reflect.TypeOf((*ItemMarshaler)(nil)).Elem()
@@ -106,6 +117,9 @@ func indirectPtrNoAlloc(rv reflect.Value) reflect.Value {
 func dig(rv reflect.Value, index []int) reflect.Value {
 	rv = indirectNoAlloc(rv)
 	for i, idx := range index {
+		if !rv.IsValid() {
+			break
+		}
 		if i == len(index)-1 {
 			rv = indirectPtrNoAlloc(rv.Field(idx))
 		} else {
@@ -115,7 +129,7 @@ func dig(rv reflect.Value, index []int) reflect.Value {
 	return rv
 }
 
-func visitFields(item map[string]*dynamodb.AttributeValue, rv reflect.Value, seen map[string]struct{}, fn func(av *dynamodb.AttributeValue, flags encodeFlags, v reflect.Value) error) error {
+func visitFields(item map[string]types.AttributeValue, rv reflect.Value, seen map[string]struct{}, fn func(av types.AttributeValue, flags encodeFlags, v reflect.Value) error) error {
 	for rv.Kind() == reflect.Pointer {
 		if rv.IsNil() {
 			if !rv.CanSet() {
@@ -181,6 +195,207 @@ func visitFields(item map[string]*dynamodb.AttributeValue, rv reflect.Value, see
 		}
 	}
 	return nil
+}
+
+type encodeKey struct {
+	rt    reflect.Type
+	flags encodeFlags
+}
+
+type structInfo struct {
+	root   reflect.Type
+	parent *structInfo
+	fields map[string]*structField // by name
+	refs   map[encodeKey][]*structField
+	types  map[encodeKey]encodeFunc
+	zeros  map[reflect.Type]func(reflect.Value) bool
+
+	seen  map[encodeKey]struct{}
+	queue []encodeKey
+}
+
+func (info *structInfo) encode(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
+	item := make(Item, len(info.fields))
+	for _, field := range info.fields {
+		fv := dig(rv, field.index)
+		if !fv.IsValid() {
+			// TODO: encode NULL?
+			continue
+		}
+
+		if field.flags&flagOmitEmpty != 0 && field.isZero != nil {
+			if field.isZero(fv) {
+				continue
+			}
+		}
+
+		av, err := field.enc(fv, field.flags)
+		if err != nil {
+			return nil, err
+		}
+		if av == nil {
+			if field.flags&flagNull != 0 {
+				item[field.name] = nullAV
+			}
+			continue
+		}
+		item[field.name] = av
+	}
+	return &types.AttributeValueMemberM{Value: item}, nil
+}
+
+func (info *structInfo) isZero(rv reflect.Value) bool {
+	if info == nil {
+		return false
+	}
+	for _, field := range info.fields {
+		fv := dig(rv, field.index)
+		if !fv.IsValid() {
+			// field doesn't exist
+			continue
+		}
+		if field.isZero == nil {
+			// see: https://github.com/guregu/dynamo/issues/247
+			// this happens when there's no substance in the field
+			// (e.g. when it's embedded and isZero is handled by the parent type)
+			continue
+		}
+		if !field.isZero(fv) {
+			return false
+		}
+	}
+	return true
+}
+
+func (info *structInfo) findEncoder(key encodeKey) encodeFunc {
+	if info == nil {
+		return nil
+	}
+	if key.rt == info.root {
+		return info.encode
+	}
+	if enc, ok := info.types[key]; ok {
+		return enc
+	}
+	return info.parent.findEncoder(key)
+}
+
+func (info *structInfo) findZero(rt reflect.Type) func(reflect.Value) bool {
+	if info == nil {
+		return nil
+	}
+	if rt == info.root {
+		return info.isZero
+	}
+	if isZero, ok := info.zeros[rt]; ok {
+		return isZero
+	}
+	return info.parent.findZero(rt)
+}
+
+func (def *typedef) structInfo(rt reflect.Type, parent *structInfo) (*structInfo, error) {
+	rti := rt
+	for rti.Kind() == reflect.Pointer {
+		rti = rti.Elem()
+	}
+	if rti.Kind() != reflect.Struct {
+		return nil, nil
+	}
+
+	info := &structInfo{
+		root:   rt,
+		parent: parent,
+		fields: make(map[string]*structField),
+		refs:   make(map[encodeKey][]*structField),
+		types:  make(map[encodeKey]encodeFunc),
+		zeros:  make(map[reflect.Type]func(reflect.Value) bool),
+		seen:   make(map[encodeKey]struct{}),
+	}
+
+	collectTypes(rt, info, nil)
+
+	for _, key := range info.queue {
+		fn, err := def.encodeType(key.rt, key.flags, info)
+		if err != nil {
+			return info, err
+		}
+		isZero := info.findZero(key.rt)
+		if isZero == nil {
+			isZero = def.isZeroFunc(key.rt)
+		}
+		for _, sf := range info.refs[key] {
+			sf.enc = fn
+			sf.isZero = isZero
+		}
+		info.types[key] = fn
+		info.zeros[key.rt] = isZero
+	}
+
+	// don't need these anymore
+	info.queue = nil
+	info.seen = nil
+
+	return info, nil
+}
+
+func collectTypes(rt reflect.Type, info *structInfo, trail []int) *structInfo {
+	for rt.Kind() == reflect.Pointer {
+		rt = rt.Elem()
+	}
+	if rt.Kind() != reflect.Struct {
+		panic("not a struct")
+	}
+
+	// fields := make(map[string]reflect.Value)
+	for i := 0; i < rt.NumField(); i++ {
+		field := rt.Field(i)
+		ft := field.Type
+		isPtr := ft.Kind() == reflect.Ptr
+
+		name, flags := fieldInfo(field)
+		if name == "-" {
+			// skip
+			continue
+		}
+
+		key := encodeKey{
+			rt:    ft,
+			flags: flags,
+		}
+
+		idx := field.Index
+		if len(trail) > 0 {
+			idx = append(trail, idx...)
+		}
+
+		sf := &structField{
+			index: idx,
+			name:  name,
+			flags: flags,
+		}
+		public := field.IsExported()
+		if _, ok := info.fields[name]; !ok {
+			if public {
+				info.fields[name] = sf
+			}
+			info.refs[key] = append(info.refs[key], sf)
+		}
+
+		// embed anonymous structs, they could be pointers so test that too
+		if (ft.Kind() == reflect.Struct || isPtr && ft.Elem().Kind() == reflect.Struct) && field.Anonymous {
+			collectTypes(ft, info, idx)
+			continue
+		}
+
+		if !public {
+			continue
+		}
+		if _, ok := info.seen[key]; ok {
+			continue
+		}
+		info.queue = append(info.queue, key)
+	}
+	return info
 }
 
 func visitTypeFields(rt reflect.Type, seen map[string]struct{}, trail []int, fn func(name string, index []int, flags encodeFlags, vt reflect.Type) error) error {
@@ -252,7 +467,7 @@ func reallocMap(v reflect.Value, size int) {
 type decodeKeyFunc func(reflect.Value, string) error
 
 func decodeMapKeyFunc(rt reflect.Type) decodeKeyFunc {
-	if reflect.PtrTo(rt.Key()).Implements(rtypeTextUnmarshaler) {
+	if reflect.PointerTo(rt.Key()).Implements(rtypeTextUnmarshaler) {
 		return func(kv reflect.Value, s string) error {
 			tm := kv.Interface().(encoding.TextUnmarshaler)
 			if err := tm.UnmarshalText([]byte(s)); err != nil {

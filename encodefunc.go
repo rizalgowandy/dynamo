@@ -7,20 +7,94 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
-type encodeFunc func(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error)
+type encodeFunc func(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error)
 
-func encodeType(rt reflect.Type, flags encodeFlags) (encodeFunc, error) {
+func (def *typedef) encodeType(rt reflect.Type, flags encodeFlags, info *structInfo) (encodeFunc, error) {
+	encKey := encodeKey{rt, flags}
+	if fn := info.findEncoder(encKey); fn != nil {
+		return fn, nil
+	}
+
 	try := rt
 	for {
-		// deref := func()
 		switch try {
+		case rtypeAttrB:
+			return encode2(func(av types.AttributeValue, _ encodeFlags) (types.AttributeValue, error) {
+				if av == nil {
+					return nil, nil
+				}
+				return av, nil
+			}), nil
+		case rtypeAttrBS:
+			return encode2(func(av types.AttributeValue, _ encodeFlags) (types.AttributeValue, error) {
+				if av == nil {
+					return nil, nil
+				}
+				return av, nil
+			}), nil
+		case rtypeAttrBOOL:
+			return encode2(func(av types.AttributeValue, _ encodeFlags) (types.AttributeValue, error) {
+				if av == nil {
+					return nil, nil
+				}
+				return av, nil
+			}), nil
+		case rtypeAttrN:
+			return encode2(func(av types.AttributeValue, _ encodeFlags) (types.AttributeValue, error) {
+				if av == nil {
+					return nil, nil
+				}
+				return av, nil
+			}), nil
+		case rtypeAttrS:
+			return encode2(func(av types.AttributeValue, _ encodeFlags) (types.AttributeValue, error) {
+				if av == nil {
+					return nil, nil
+				}
+				return av, nil
+			}), nil
+		case rtypeAttrL:
+			return encode2(func(av types.AttributeValue, _ encodeFlags) (types.AttributeValue, error) {
+				if av == nil {
+					return nil, nil
+				}
+				return av, nil
+			}), nil
+		case rtypeAttrNS:
+			return encode2(func(av types.AttributeValue, _ encodeFlags) (types.AttributeValue, error) {
+				if av == nil {
+					return nil, nil
+				}
+				return av, nil
+			}), nil
+		case rtypeAttrSS:
+			return encode2(func(av types.AttributeValue, _ encodeFlags) (types.AttributeValue, error) {
+				if av == nil {
+					return nil, nil
+				}
+				return av, nil
+			}), nil
+		case rtypeAttrM:
+			return encode2(func(av types.AttributeValue, _ encodeFlags) (types.AttributeValue, error) {
+				if av == nil {
+					return nil, nil
+				}
+				return av, nil
+			}), nil
+		case rtypeAttrNULL:
+			return encode2(func(av types.AttributeValue, _ encodeFlags) (types.AttributeValue, error) {
+				if av == nil {
+					return nil, nil
+				}
+				return av, nil
+			}), nil
+
 		case rtypeAttr:
-			return encode2(func(av *dynamodb.AttributeValue, _ encodeFlags) (*dynamodb.AttributeValue, error) {
+			return encode2(func(av types.AttributeValue, _ encodeFlags) (types.AttributeValue, error) {
 				if av == nil {
 					return nil, nil
 				}
@@ -33,14 +107,13 @@ func encodeType(rt reflect.Type, flags encodeFlags) (encodeFunc, error) {
 		}
 		switch {
 		case try.Implements(rtypeMarshaler):
-			return encode2(func(x Marshaler, _ encodeFlags) (*dynamodb.AttributeValue, error) {
+			return encode2(func(x Marshaler, _ encodeFlags) (types.AttributeValue, error) {
 				return x.MarshalDynamo()
 			}), nil
 		case try.Implements(rtypeAWSMarshaler):
-			return encode2(func(x dynamodbattribute.Marshaler, _ encodeFlags) (*dynamodb.AttributeValue, error) {
-				var av dynamodb.AttributeValue
-				err := x.MarshalDynamoDBAttributeValue(&av)
-				return &av, err
+			return encode2(func(x attributevalue.Marshaler, _ encodeFlags) (types.AttributeValue, error) {
+				av, err := x.MarshalDynamoDBAttributeValue()
+				return av, err
 			}), nil
 		case try.Implements(rtypeTextMarshaler):
 			return encodeTextMarshaler, nil
@@ -54,12 +127,12 @@ func encodeType(rt reflect.Type, flags encodeFlags) (encodeFunc, error) {
 
 	switch rt.Kind() {
 	case reflect.Pointer:
-		return encodePtr(rt, flags)
+		return def.encodePtr(rt, flags, info)
 
 	// BOOL
 	case reflect.Bool:
-		return func(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
-			return &dynamodb.AttributeValue{BOOL: aws.Bool(rv.Bool())}, nil
+		return func(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
+			return &types.AttributeValueMemberBOOL{Value: rv.Bool()}, nil
 		}, nil
 
 	// N
@@ -84,7 +157,7 @@ func encodeType(rt reflect.Type, flags encodeFlags) (encodeFunc, error) {
 			return encodeSet(rt, flags)
 		}
 		// lists (L)
-		return encodeList(rt, flags)
+		return def.encodeList(rt, flags, info)
 
 	case reflect.Map:
 		// sets (NS, SS, BS)
@@ -92,26 +165,26 @@ func encodeType(rt reflect.Type, flags encodeFlags) (encodeFunc, error) {
 			return encodeSet(rt, flags)
 		}
 		// M
-		return encodeMapM(rt, flags)
+		return def.encodeMapM(rt, flags, info)
 
 	// M
 	case reflect.Struct:
-		return encodeStruct(rt)
+		return def.encodeStruct(rt, flags, info)
 
 	case reflect.Interface:
 		if rt.NumMethod() == 0 {
-			return encodeAny, nil
+			return def.encodeAny, nil
 		}
 	}
 	return nil, fmt.Errorf("dynamo marshal: unsupported type %s", rt.String())
 }
 
-func encodePtr(rt reflect.Type, flags encodeFlags) (encodeFunc, error) {
-	elem, err := encodeType(rt.Elem(), flags)
+func (def *typedef) encodePtr(rt reflect.Type, flags encodeFlags, info *structInfo) (encodeFunc, error) {
+	elem, err := def.encodeType(rt.Elem(), flags, info)
 	if err != nil {
 		return nil, err
 	}
-	return func(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
+	return func(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
 		if rv.IsNil() {
 			if flags&flagNull != 0 {
 				return nullAV, nil
@@ -122,10 +195,10 @@ func encodePtr(rt reflect.Type, flags encodeFlags) (encodeFunc, error) {
 	}, nil
 }
 
-func encode2[T any](fn func(T, encodeFlags) (*dynamodb.AttributeValue, error)) func(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
+func encode2[T any](fn func(T, encodeFlags) (types.AttributeValue, error)) func(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
 	target := reflect.TypeOf((*T)(nil)).Elem()
 	interfacing := target.Kind() == reflect.Interface
-	return func(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
+	return func(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
 		if !rv.IsValid() || !rv.CanInterface() {
 			return nil, nil
 		}
@@ -145,7 +218,7 @@ func encode2[T any](fn func(T, encodeFlags) (*dynamodb.AttributeValue, error)) f
 	}
 }
 
-func encodeString(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
+func encodeString(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
 	s := rv.String()
 	if len(s) == 0 {
 		if flags&flagAllowEmpty != 0 {
@@ -156,28 +229,28 @@ func encodeString(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue
 		}
 		return nil, nil
 	}
-	return &dynamodb.AttributeValue{S: &s}, nil
+	return &types.AttributeValueMemberS{Value: s}, nil
 }
 
-var encodeTextMarshaler = encode2[encoding.TextMarshaler](func(x encoding.TextMarshaler, flags encodeFlags) (*dynamodb.AttributeValue, error) {
+var encodeTextMarshaler = encode2[encoding.TextMarshaler](func(x encoding.TextMarshaler, flags encodeFlags) (types.AttributeValue, error) {
 	text, err := x.MarshalText()
 	switch {
 	case err != nil:
 		return nil, err
 	case len(text) == 0:
 		if flags&flagAllowEmpty != 0 {
-			return &dynamodb.AttributeValue{S: new(string)}, nil
+			return emptyS, nil
 		}
 		return nil, nil
 	}
 	str := string(text)
-	return &dynamodb.AttributeValue{S: &str}, nil
+	return &types.AttributeValueMemberS{Value: str}, nil
 })
 
 func encodeBytes(rt reflect.Type, flags encodeFlags) encodeFunc {
 	if rt.Kind() == reflect.Array {
 		size := rt.Len()
-		return func(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
+		return func(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
 			if rv.IsZero() {
 				switch {
 				case flags&flagNull != 0:
@@ -189,11 +262,11 @@ func encodeBytes(rt reflect.Type, flags encodeFlags) encodeFunc {
 			}
 			data := make([]byte, size)
 			reflect.Copy(reflect.ValueOf(data), rv)
-			return &dynamodb.AttributeValue{B: data}, nil
+			return &types.AttributeValueMemberB{Value: data}, nil
 		}
 	}
 
-	return func(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
+	return func(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
 		if rv.IsNil() {
 			if flags&flagNull != 0 {
 				return nullAV, nil
@@ -206,21 +279,27 @@ func encodeBytes(rt reflect.Type, flags encodeFlags) encodeFunc {
 			}
 			return nil, nil
 		}
-		return &dynamodb.AttributeValue{B: rv.Bytes()}, nil
+		return &types.AttributeValueMemberB{Value: rv.Bytes()}, nil
 	}
 }
 
-func encodeStruct(rt reflect.Type) (encodeFunc, error) {
-	fields, err := structFields(rt)
+func (def *typedef) encodeStruct(rt reflect.Type, flags encodeFlags, info *structInfo) (encodeFunc, error) {
+	info2, err := def.structInfo(rt, info)
 	if err != nil {
 		return nil, err
 	}
-	return func(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
+
+	var fields []structField
+	for _, field := range info2.fields {
+		fields = append(fields, *field)
+	}
+
+	return func(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
 		item, err := encodeItem(fields, rv)
 		if err != nil {
 			return nil, err
 		}
-		return &dynamodb.AttributeValue{M: item}, nil
+		return &types.AttributeValueMemberM{Value: item}, nil
 	}, nil
 }
 
@@ -254,8 +333,8 @@ func encodeSliceSet(rt /* []T */ reflect.Type, flags encodeFlags) (encodeFunc, e
 	return nil, fmt.Errorf("dynamo: invalid type for set: %v", rt)
 }
 
-func encodeSliceTMSS(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
-	ss := make([]*string, 0, rv.Len())
+func encodeSliceTMSS(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
+	ss := make([]string, 0, rv.Len())
 	for i := 0; i < rv.Len(); i++ {
 		tm := rv.Index(i).Interface().(encoding.TextMarshaler)
 		text, err := tm.MarshalText()
@@ -265,30 +344,30 @@ func encodeSliceTMSS(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeVa
 		if flags&flagOmitEmptyElem != 0 && len(text) == 0 {
 			continue
 		}
-		ss = append(ss, aws.String(string(text)))
+		ss = append(ss, string(text))
 	}
 	if len(ss) == 0 {
 		return nil, nil
 	}
-	return &dynamodb.AttributeValue{SS: ss}, nil
+	return &types.AttributeValueMemberSS{Value: ss}, nil
 }
 
-func encodeSliceSS(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
-	ss := make([]*string, 0, rv.Len())
+func encodeSliceSS(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
+	ss := make([]string, 0, rv.Len())
 	for i := 0; i < rv.Len(); i++ {
 		s := rv.Index(i).String()
 		if flags&flagOmitEmptyElem != 0 && s == "" {
 			continue
 		}
-		ss = append(ss, aws.String(s))
+		ss = append(ss, s)
 	}
 	if len(ss) == 0 {
 		return nil, nil
 	}
-	return &dynamodb.AttributeValue{SS: ss}, nil
+	return &types.AttributeValueMemberSS{Value: ss}, nil
 }
 
-func encodeSliceBS(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
+func encodeSliceBS(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
 	bs := make([][]byte, 0, rv.Len())
 	for i := 0; i < rv.Len(); i++ {
 		b := rv.Index(i).Bytes()
@@ -300,10 +379,10 @@ func encodeSliceBS(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValu
 	if len(bs) == 0 {
 		return nil, nil
 	}
-	return &dynamodb.AttributeValue{BS: bs}, nil
+	return &types.AttributeValueMemberBS{Value: bs}, nil
 }
 
-func encodeMapM(rt reflect.Type, flags encodeFlags) (encodeFunc, error) {
+func (def *typedef) encodeMapM(rt reflect.Type, flags encodeFlags, info *structInfo) (encodeFunc, error) {
 	keyString := encodeMapKeyFunc(rt)
 	if keyString == nil {
 		return nil, fmt.Errorf("dynamo marshal: map key type must be string or encoding.TextMarshaler, have %v", rt)
@@ -319,15 +398,15 @@ func encodeMapM(rt reflect.Type, flags encodeFlags) (encodeFunc, error) {
 		subflags |= flagOmitEmpty
 	}
 
-	valueEnc, err := encodeType(rt.Elem(), subflags)
+	valueEnc, err := def.encodeType(rt.Elem(), subflags, info)
 	if err != nil {
 		return nil, err
 	}
 
-	return func(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
+	return func(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
 		if rv.IsNil() {
 			if flags&flagAllowEmpty != 0 {
-				return &dynamodb.AttributeValue{M: map[string]*dynamodb.AttributeValue{}}, nil
+				return &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{}}, nil
 			}
 			if flags&flagNull != 0 {
 				return nullAV, nil
@@ -335,7 +414,7 @@ func encodeMapM(rt reflect.Type, flags encodeFlags) (encodeFunc, error) {
 			return nil, nil
 		}
 
-		avs := make(map[string]*dynamodb.AttributeValue, rv.Len())
+		avs := make(map[string]types.AttributeValue, rv.Len())
 
 		iter := rv.MapRange()
 		for iter.Next() {
@@ -359,7 +438,7 @@ func encodeMapM(rt reflect.Type, flags encodeFlags) (encodeFunc, error) {
 			return nil, nil
 		}
 
-		return &dynamodb.AttributeValue{M: avs}, nil
+		return &types.AttributeValueMemberM{Value: avs}, nil
 	}, nil
 }
 
@@ -371,9 +450,9 @@ func encodeMapSet(rt /* map[T]bool | map[T]struct{} */ reflect.Type, flags encod
 	}
 
 	if rt.Key().Implements(rtypeTextMarshaler) {
-		return func(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
+		return func(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
 			length := rv.Len()
-			ss := make([]*string, 0, length)
+			ss := make([]string, 0, length)
 			iter := rv.MapRange()
 			for iter.Next() {
 				if useBool && !iter.Value().Equal(truthy) {
@@ -387,12 +466,12 @@ func encodeMapSet(rt /* map[T]bool | map[T]struct{} */ reflect.Type, flags encod
 					continue
 				}
 				str := string(text)
-				ss = append(ss, &str)
+				ss = append(ss, str)
 			}
 			if len(ss) == 0 {
 				return nil, nil
 			}
-			return &dynamodb.AttributeValue{SS: ss}, nil
+			return &types.AttributeValueMemberSS{Value: ss}, nil
 		}, nil
 	}
 
@@ -407,8 +486,8 @@ func encodeMapSet(rt /* map[T]bool | map[T]struct{} */ reflect.Type, flags encod
 
 	// SS
 	case reflect.String:
-		return func(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
-			ss := make([]*string, 0, rv.Len())
+		return func(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
+			ss := make([]string, 0, rv.Len())
 			iter := rv.MapRange()
 			for iter.Next() {
 				if useBool && !iter.Value().Equal(truthy) {
@@ -418,19 +497,19 @@ func encodeMapSet(rt /* map[T]bool | map[T]struct{} */ reflect.Type, flags encod
 				if flags&flagOmitEmptyElem != 0 && s == "" {
 					continue
 				}
-				ss = append(ss, aws.String(s))
+				ss = append(ss, s)
 			}
 			if len(ss) == 0 {
 				return nil, nil
 			}
-			return &dynamodb.AttributeValue{SS: ss}, nil
+			return &types.AttributeValueMemberSS{Value: ss}, nil
 		}, nil
 
 	// BS
 	case reflect.Array:
 		if rt.Key().Elem().Kind() == reflect.Uint8 {
 			size := rt.Key().Len()
-			return func(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
+			return func(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
 				bs := make([][]byte, 0, rv.Len())
 				key := make([]byte, size)
 				keyv := reflect.ValueOf(key)
@@ -445,7 +524,7 @@ func encodeMapSet(rt /* map[T]bool | map[T]struct{} */ reflect.Type, flags encod
 				if len(bs) == 0 {
 					return nil, nil
 				}
-				return &dynamodb.AttributeValue{BS: bs}, nil
+				return &types.AttributeValueMemberBS{Value: bs}, nil
 			}, nil
 		}
 	}
@@ -458,34 +537,34 @@ type numberType interface {
 }
 
 func encodeN[T numberType](get func(reflect.Value) T, format func(T, int) string) encodeFunc {
-	return func(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
+	return func(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
 		str := format(get(rv), 10)
-		return &dynamodb.AttributeValue{N: &str}, nil
+		return &types.AttributeValueMemberN{Value: str}, nil
 	}
 }
 
 func encodeSliceNS[T numberType](get func(reflect.Value) T, format func(T, int) string) encodeFunc {
-	return func(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
-		ns := make([]*string, 0, rv.Len())
+	return func(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
+		ns := make([]string, 0, rv.Len())
 		for i := 0; i < rv.Len(); i++ {
 			n := get(rv.Index(i))
 			if flags&flagOmitEmptyElem != 0 && n == 0 {
 				continue
 			}
 			str := format(n, 10)
-			ns = append(ns, &str)
+			ns = append(ns, str)
 		}
 		if len(ns) == 0 {
 			return nil, nil
 		}
-		return &dynamodb.AttributeValue{NS: ns}, nil
+		return &types.AttributeValueMemberNS{Value: ns}, nil
 	}
 }
 
 func encodeMapNS[T numberType](truthy reflect.Value, get func(reflect.Value) T, format func(T, int) string) encodeFunc {
 	useBool := truthy.Kind() == reflect.Bool
-	return func(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
-		ns := make([]*string, 0, rv.Len())
+	return func(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
+		ns := make([]string, 0, rv.Len())
 		iter := rv.MapRange()
 		for iter.Next() {
 			if useBool && !iter.Value().Equal(truthy) {
@@ -496,12 +575,12 @@ func encodeMapNS[T numberType](truthy reflect.Value, get func(reflect.Value) T, 
 				continue
 			}
 			str := format(n, 10)
-			ns = append(ns, &str)
+			ns = append(ns, str)
 		}
 		if len(ns) == 0 {
 			return nil, nil
 		}
-		return &dynamodb.AttributeValue{NS: ns}, nil
+		return &types.AttributeValueMemberNS{Value: ns}, nil
 	}
 }
 
@@ -516,7 +595,7 @@ func encodeSet(rt /* []T | map[T]bool | map[T]struct{} */ reflect.Type, flags en
 	return nil, fmt.Errorf("dynamo: marshal: invalid type for set %s", rt.String())
 }
 
-func encodeList(rt reflect.Type, flags encodeFlags) (encodeFunc, error) {
+func (def *typedef) encodeList(rt reflect.Type, flags encodeFlags, info *structInfo) (encodeFunc, error) {
 	// lists CAN be empty
 	subflags := flagNone
 	if flags&flagOmitEmptyElem == 0 {
@@ -530,13 +609,13 @@ func encodeList(rt reflect.Type, flags encodeFlags) (encodeFunc, error) {
 		subflags |= flagAllowEmptyElem
 	}
 
-	valueEnc, err := encodeType(rt.Elem(), subflags)
+	valueEnc, err := def.encodeType(rt.Elem(), subflags, info)
 	if err != nil {
 		return nil, err
 	}
 
-	return func(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
-		avs := make([]*dynamodb.AttributeValue, 0, rv.Len())
+	return func(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
+		avs := make([]types.AttributeValue, 0, rv.Len())
 		for i := 0; i < rv.Len(); i++ {
 			innerVal := rv.Index(i)
 			av, err := valueEnc(innerVal, flags|subflags)
@@ -556,18 +635,18 @@ func encodeList(rt reflect.Type, flags encodeFlags) (encodeFunc, error) {
 		if flags&flagOmitEmpty != 0 && len(avs) == 0 {
 			return nil, nil
 		}
-		return &dynamodb.AttributeValue{L: avs}, nil
+		return &types.AttributeValueMemberL{Value: avs}, nil
 	}, nil
 }
 
-func encodeAny(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, error) {
+func (def *typedef) encodeAny(rv reflect.Value, flags encodeFlags) (types.AttributeValue, error) {
 	if !rv.CanInterface() || rv.IsNil() {
 		if flags&flagNull != 0 {
 			return nullAV, nil
 		}
 		return nil, nil
 	}
-	enc, err := encodeType(rv.Elem().Type(), flags)
+	enc, err := def.encodeType(rv.Elem().Type(), flags, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -577,20 +656,20 @@ func encodeAny(rv reflect.Value, flags encodeFlags) (*dynamodb.AttributeValue, e
 func encodeUnixTime(rt reflect.Type) encodeFunc {
 	switch rt {
 	case rtypeTimePtr:
-		return encode2[*time.Time](func(t *time.Time, flags encodeFlags) (*dynamodb.AttributeValue, error) {
+		return encode2[*time.Time](func(t *time.Time, flags encodeFlags) (types.AttributeValue, error) {
 			if t == nil || t.IsZero() {
 				return nil, nil
 			}
 			str := strconv.FormatInt(t.Unix(), 10)
-			return &dynamodb.AttributeValue{N: &str}, nil
+			return &types.AttributeValueMemberN{Value: str}, nil
 		})
 	case rtypeTime:
-		return encode2[time.Time](func(t time.Time, flags encodeFlags) (*dynamodb.AttributeValue, error) {
+		return encode2[time.Time](func(t time.Time, flags encodeFlags) (types.AttributeValue, error) {
 			if t.IsZero() {
 				return nil, nil
 			}
 			str := strconv.FormatInt(t.Unix(), 10)
-			return &dynamodb.AttributeValue{N: &str}, nil
+			return &types.AttributeValueMemberN{Value: str}, nil
 		})
 	}
 	panic(fmt.Errorf("not time type: %v", rt))
